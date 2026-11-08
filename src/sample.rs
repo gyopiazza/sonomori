@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
@@ -269,13 +269,7 @@ fn slice_info(left: &[f32], right: &[f32], start: usize, end: usize) -> SliceInf
 }
 
 fn waveform_peaks(left: &[f32], right: &[f32]) -> Vec<WaveformPeak> {
-    let mut peaks = vec![
-        WaveformPeak {
-            min: 0.0,
-            max: 0.0
-        };
-        WAVEFORM_COLUMNS
-    ];
+    let mut peaks = vec![WaveformPeak { min: 0.0, max: 0.0 }; WAVEFORM_COLUMNS];
     let frames = left.len().min(right.len());
     if frames == 0 {
         return peaks;

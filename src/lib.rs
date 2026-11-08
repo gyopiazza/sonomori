@@ -6,18 +6,21 @@ mod slice;
 
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwapOption;
 use atomic_float::AtomicF32;
 use nice_plug::prelude::*;
-use nice_plug_egui::{EguiEditor, EguiEditorState, EguiNiceSettings, RepaintNotifier, create_egui_editor};
+use nice_plug_iced::iced::PollSubNotifier;
+use nice_plug_iced::{
+    IcedEditor, IcedEditorState, IcedNiceSettings, application, create_iced_editor,
+};
 use parking_lot::Mutex;
 
-use editor::SonomoriEditor;
-use engine::{step_at, Engine, FrameInput};
-use pattern::{GenParams, Pattern, MAX_STEPS};
+use editor::{EditorModel, Gui};
+use engine::{Engine, FrameInput, step_at};
+use pattern::{GenParams, MAX_STEPS, Pattern};
 use sample::SampleData;
 use slice::sensitivity_bucket;
 
@@ -29,9 +32,9 @@ const RESIZE_HINT: ResizeHint = ResizeHint::resizable()
 pub struct Sonomori {
     params: Arc<SonomoriParams>,
     shared: Shared,
-    editor_state: Arc<EguiEditorState>,
-    repaint_notifier: RepaintNotifier,
-    initial_editor: Option<SonomoriEditor>,
+    editor_state: Arc<IcedEditorState>,
+    repaint_notifier: PollSubNotifier,
+    editor_model: Option<EditorModel>,
     preview_rx: rtrb::Consumer<u32>,
     snapshot_tx: triple_buffer::Input<Snapshot>,
     engine: Engine,
@@ -104,6 +107,7 @@ pub(crate) enum LoadStatus {
 pub(crate) struct Snapshot {
     pub pattern: Pattern,
     pub playhead: Option<usize>,
+    #[allow(dead_code)]
     pub playing: bool,
     pub host_playing: bool,
     pub bpm: f32,
@@ -145,10 +149,17 @@ impl Default for SonomoriParams {
             symmetry: percent_param("Symmetry", 0.55),
             pattern_var: percent_param("Pattern Variation", 0.2),
             sound_var: percent_param("Sound Variation", 0.25),
-            swing: FloatParam::new("Swing", 0.5, FloatRange::Linear { min: 0.5, max: 0.75 })
-                .with_step_size(0.01)
-                .with_value_to_string(Arc::new(|value| format!("{:.0}%", value * 100.0)))
-                .with_string_to_value(Arc::new(parse_ratio)),
+            swing: FloatParam::new(
+                "Swing",
+                0.5,
+                FloatRange::Linear {
+                    min: 0.5,
+                    max: 0.75,
+                },
+            )
+            .with_step_size(0.01)
+            .with_value_to_string(Arc::new(|value| format!("{:.0}%", value * 100.0)))
+            .with_string_to_value(Arc::new(parse_ratio)),
             decay: percent_param("Decay", 0.55),
             pitch: IntParam::new("Pitch", 0, IntRange::Linear { min: -12, max: 12 })
                 .with_unit(" st"),
@@ -158,7 +169,10 @@ impl Default for SonomoriParams {
             tempo: FloatParam::new(
                 "Audition BPM",
                 120.0,
-                FloatRange::Linear { min: 40.0, max: 240.0 },
+                FloatRange::Linear {
+                    min: 40.0,
+                    max: 240.0,
+                },
             )
             .with_step_size(1.0)
             .with_unit(" BPM")
@@ -172,7 +186,14 @@ impl Default for SonomoriParams {
             .with_unit(" dB")
             .with_value_to_string(formatters::v2s_f32_gain_to_db(1))
             .with_string_to_value(formatters::s2v_f32_gain_to_db()),
-            seed: IntParam::new("Seed", 1, IntRange::Linear { min: 1, max: 999_999 }),
+            seed: IntParam::new(
+                "Seed",
+                1,
+                IntRange::Linear {
+                    min: 1,
+                    max: 999_999,
+                },
+            ),
             sample_path: Mutex::new(String::new()),
         }
     }
@@ -186,19 +207,26 @@ fn percent_param(name: &'static str, default: f32) -> FloatParam {
 }
 
 fn bipolar_param(name: &'static str, default: f32) -> FloatParam {
-    FloatParam::new(name, default, FloatRange::Linear { min: -1.0, max: 1.0 })
-        .with_step_size(0.01)
-        .with_value_to_string(Arc::new(|value| format!("{:+.0}", value * 100.0)))
-        .with_string_to_value(Arc::new(|text| {
-            let trimmed = text.trim().trim_end_matches('%').trim();
-            trimmed.parse::<f32>().ok().map(|value| {
-                if value.abs() > 1.5 {
-                    value / 100.0
-                } else {
-                    value
-                }
-            })
-        }))
+    FloatParam::new(
+        name,
+        default,
+        FloatRange::Linear {
+            min: -1.0,
+            max: 1.0,
+        },
+    )
+    .with_step_size(0.01)
+    .with_value_to_string(Arc::new(|value| format!("{:+.0}", value * 100.0)))
+    .with_string_to_value(Arc::new(|text| {
+        let trimmed = text.trim().trim_end_matches('%').trim();
+        trimmed.parse::<f32>().ok().map(|value| {
+            if value.abs() > 1.5 {
+                value / 100.0
+            } else {
+                value
+            }
+        })
+    }))
 }
 
 fn parse_ratio(text: &str) -> Option<f32> {
@@ -219,19 +247,15 @@ impl Default for Sonomori {
         };
         let (preview_tx, preview_rx) = rtrb::RingBuffer::new(32);
         let (snapshot_tx, snapshot_rx) = triple_buffer::triple_buffer(&Snapshot::default());
-        let editor = SonomoriEditor::new(
-            params.clone(),
-            shared.clone(),
-            preview_tx,
-            snapshot_rx,
-        );
+        let editor_model =
+            EditorModel::new(params.clone(), shared.clone(), preview_tx, snapshot_rx);
 
         Self {
             params,
             shared,
-            editor_state: EguiEditorState::from_size(WINDOW_SIZE, 1.0),
-            repaint_notifier: RepaintNotifier::new(),
-            initial_editor: Some(editor),
+            editor_state: IcedEditorState::from_size(WINDOW_SIZE, 1.0),
+            repaint_notifier: PollSubNotifier::new(),
+            editor_model: Some(editor_model),
             preview_rx,
             snapshot_tx,
             engine: Engine::new(44_100.0),
@@ -301,7 +325,7 @@ impl Plugin for Sonomori {
 
     const SAMPLE_ACCURATE_AUTOMATION: bool = true;
 
-    type Editor = EguiEditor<SonomoriEditor>;
+    type Editor = IcedEditor;
     type SysExMessage = ();
     type BackgroundTask = ();
 
@@ -310,14 +334,21 @@ impl Plugin for Sonomori {
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Self::Editor> {
-        let editor = self.initial_editor.take()?;
-        create_egui_editor(
+        let model = self.editor_model.take()?;
+        create_iced_editor(
             self.editor_state.clone(),
+            model,
             self.repaint_notifier.clone(),
-            EguiNiceSettings::new()
+            IcedNiceSettings::new()
                 .with_tile(Self::NAME)
                 .with_resize_hint(RESIZE_HINT),
-            editor,
+            |model, ctx| {
+                Ok(application(model, ctx, Gui::new, Gui::update, Gui::view)
+                    .theme(Gui::theme)
+                    .scale_factor(Gui::scale_factor)
+                    .subscription(Gui::subscription)
+                    .run())
+            },
         )
     }
 
@@ -365,6 +396,7 @@ impl Plugin for Sonomori {
 
         let bucket = sensitivity_bucket(self.params.sensitivity.value());
         let generation = sample.map(|loaded| loaded.generation).unwrap_or(0);
+        let previous_key = self.pattern_key;
         let key = PatternKey {
             seed: self.params.seed.value(),
             density: quantize(self.params.density.value()),
@@ -503,11 +535,12 @@ impl Plugin for Sonomori {
             bpm: bpm as f32,
         });
 
-        if self.editor_state.is_open() && (playing || next_meter > 0.001) {
+        let pattern_changed = previous_key != self.pattern_key;
+        if self.editor_state.is_open() && (playing || next_meter > 0.001 || pattern_changed) {
             self.repaint_accum += frames;
             if self.repaint_accum >= self.repaint_interval {
                 self.repaint_accum = 0;
-                self.repaint_notifier.request_repaint();
+                self.repaint_notifier.notify();
             }
         }
 

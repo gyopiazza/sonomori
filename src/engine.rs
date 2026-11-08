@@ -4,7 +4,7 @@
 //! timeline when it is playing, in sixteenth notes, with a swing ratio that
 //! delays every other sixteenth.
 
-use crate::pattern::{Pattern, LANES, MAX_STEPS};
+use crate::pattern::{LANES, MAX_STEPS, Pattern};
 use crate::sample::SampleData;
 
 const VOICES: usize = LANES + 1;
@@ -61,11 +61,7 @@ impl DcBlock {
         let output = input - self.x1 + 0.995 * self.y1;
         self.x1 = input;
         self.y1 = output;
-        if output.abs() < 1.0e-20 {
-            0.0
-        } else {
-            output
-        }
+        if output.abs() < 1.0e-20 { 0.0 } else { output }
     }
 }
 
@@ -318,7 +314,10 @@ impl Voice {
         }
 
         let level = self.env * end_fade * self.gain * 0.45;
-        (self.lp_l * level * self.pan_l, self.lp_r * level * self.pan_r)
+        (
+            self.lp_l * level * self.pan_l,
+            self.lp_r * level * self.pan_r,
+        )
     }
 }
 
@@ -353,7 +352,7 @@ fn soft_clip(sample: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pattern::{LanePattern, Pattern, LANES};
+    use crate::pattern::{LANES, LanePattern, Pattern};
     use crate::sample::SampleData;
     use crate::slice::sensitivity_bucket;
 
@@ -440,7 +439,11 @@ mod tests {
             around_downbeat < around_hit * 0.25,
             "downbeat {around_downbeat} should stay quieter than the hit {around_hit}"
         );
-        assert!(left.iter().chain(right.iter()).all(|sample| sample.is_finite()));
+        assert!(
+            left.iter()
+                .chain(right.iter())
+                .all(|sample| sample.is_finite())
+        );
     }
 
     fn peak_around(buffer: &[f32], start: usize, end: usize) -> f32 {

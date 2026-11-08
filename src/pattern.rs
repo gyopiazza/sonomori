@@ -122,7 +122,16 @@ pub fn generate(slices: &[SliceInfo], params: &GenParams) -> Pattern {
     for bar in 0..bars {
         for step in 0..8 {
             let index = bar * STEPS_PER_BAR + step;
-            write_step(&mut pattern, params.seed, bar, step, index, density, sync, pattern_var);
+            write_step(
+                &mut pattern,
+                params.seed,
+                bar,
+                step,
+                index,
+                density,
+                sync,
+                pattern_var,
+            );
         }
         for step in 8..STEPS_PER_BAR {
             let index = bar * STEPS_PER_BAR + step;
@@ -145,8 +154,7 @@ pub fn generate(slices: &[SliceInfo], params: &GenParams) -> Pattern {
         for step in 0..STEPS_PER_BAR {
             for lane in 0..LANES {
                 let keep = pattern_var <= 0.001
-                    || hash01(params.seed, 120 + lane as u32, step as u32)
-                        < (1.0 - pattern_var);
+                    || hash01(params.seed, 120 + lane as u32, step as u32) < (1.0 - pattern_var);
                 if keep {
                     pattern.lanes[lane].velocity[STEPS_PER_BAR + step] =
                         pattern.lanes[lane].velocity[step];
@@ -184,9 +192,8 @@ fn hit(
     pattern_var: f32,
 ) -> f32 {
     let weight = step_weight(lane, step, density, sync);
-    let jitter = (hash01(seed, 200 + lane as u32, (bar * 16 + step) as u32) - 0.5)
-        * pattern_var
-        * 0.45;
+    let jitter =
+        (hash01(seed, 200 + lane as u32, (bar * 16 + step) as u32) - 0.5) * pattern_var * 0.45;
     let probability = (weight + jitter).clamp(0.0, 0.98);
     let roll = hash01(seed, 400 + lane as u32, (bar * 32 + step) as u32);
     if roll >= probability {
@@ -295,7 +302,10 @@ fn pick_slices(slices: &[SliceInfo], seed: u32) -> [usize; LANES] {
     let mid_end = ((count * 2) / 3).clamp(low_end, count);
     let mut pools = [(0usize, count); LANES];
     pools[LANE_LOW] = (0, low_end);
-    pools[LANE_MID] = (low_end.saturating_sub((count > 1) as usize), mid_end.max(low_end));
+    pools[LANE_MID] = (
+        low_end.saturating_sub((count > 1) as usize),
+        mid_end.max(low_end),
+    );
     pools[LANE_HIGH] = (mid_end.saturating_sub((count > 2) as usize), count);
     pools[LANE_EXTRA] = (0, count);
     if pools[LANE_MID].1 <= pools[LANE_MID].0 {
@@ -567,9 +577,6 @@ mod tests {
                 }
             }
         }
-        assert!(
-            pushed > straight,
-            "pushed {pushed} straight {straight}"
-        );
+        assert!(pushed > straight, "pushed {pushed} straight {straight}");
     }
 }
