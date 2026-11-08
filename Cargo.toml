@@ -1,0 +1,44 @@
+[package]
+name = "sonomori"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Slice an imported sound into a tempo-synced loop"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+arc-swap = "1"
+atomic_float = "1.1"
+egui = { version = "0.37.0", features = ["default_fonts"] }
+nice-plug = { version = "0.4.2", features = ["standalone"] }
+nice-plug-egui = "0.6.0"
+parking_lot = "0.12"
+rfd = "0.15"
+rtrb = "0.4"
+symphonia = { version = "0.5", default-features = false, features = [
+    "aac",
+    "alac",
+    "flac",
+    "isomp4",
+    "mp3",
+    "ogg",
+    "pcm",
+    "vorbis",
+    "wav",
+] }
+triple_buffer = "9"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+dispatch2 = "0.3"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
