@@ -5,41 +5,49 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
+use crate::features;
+use crate::score::MIN_SLICE_SAMPLES;
 use crate::slice::{self, SENSITIVITY_BUCKETS};
 
 pub const MAX_SECONDS: f32 = 30.0;
+pub const IMPORT_EXTENSIONS: &[&str] = &["wav", "mp3", "flac", "ogg", "aac", "m4a"];
 const WAVEFORM_COLUMNS: usize = 512;
 
-static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Clone, Debug)]
-pub struct SliceInfo {
-    pub start: usize,
-    pub end: usize,
-    #[allow(dead_code)]
-    pub peak: f32,
-    #[allow(dead_code)]
-    pub rms: f32,
-    pub brightness: f32,
-    pub punch: f32,
-    /// Peak-normalizing gain, capped so quiet noise is not boosted without limit.
-    pub norm_gain: f32,
-    /// Share of energy below ~180 Hz. Kicks live here.
-    pub low_ratio: f32,
-    /// Share of energy between ~180 Hz and ~4.5 kHz.
-    pub mid_ratio: f32,
-    /// Share of energy above ~4.5 kHz. Hats live here.
-    pub high_ratio: f32,
-    /// Length of the trimmed slice in seconds.
-    pub seconds: f32,
+pub fn formats_phrase() -> String {
+    let names: Vec<String> = IMPORT_EXTENSIONS
+        .iter()
+        .map(|extension| extension.to_uppercase())
+        .collect();
+    match names.as_slice() {
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{}, or {last}", rest.join(", ")),
+        [] => String::new(),
+    }
 }
+
+pub fn idle_hint() -> String {
+    format!(
+        "Import a {} file. Longer files use the first {MAX_SECONDS:.0} seconds.",
+        formats_phrase()
+    )
+}
+
+pub fn trimmed_note(trimmed: bool) -> String {
+    if trimmed {
+        format!("  ·  using the first {MAX_SECONDS:.0} seconds")
+    } else {
+        String::new()
+    }
+}
+
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug)]
 pub struct WaveformPeak {
@@ -57,7 +65,7 @@ pub struct SampleData {
     pub peaks: Vec<WaveformPeak>,
     pub display_peak: f32,
     /// `buckets[sensitivity_bucket]` is the slice set for that knob position.
-    pub buckets: Vec<Vec<SliceInfo>>,
+    pub buckets: Vec<Vec<features::SliceInfo>>,
     pub generation: u64,
     pub trimmed: bool,
     pub seconds: f32,
@@ -132,27 +140,15 @@ pub fn load(path: &Path) -> Result<SampleData, String> {
         let channels = spec.channels.count().max(1);
         let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
         buffer.copy_interleaved_ref(decoded);
-        let samples = buffer.samples();
-        if channels == 1 {
-            for &sample in samples {
-                if left.len() >= max_frames {
-                    trimmed = true;
-                    break;
-                }
-                left.push(sample);
-                right.push(sample);
+        for frame in buffer.samples().chunks(channels) {
+            if left.len() >= max_frames {
+                trimmed = true;
+                break;
             }
-        } else {
-            for frame in samples.chunks(channels) {
-                if left.len() >= max_frames {
-                    trimmed = true;
-                    break;
-                }
-                let first = frame.first().copied().unwrap_or(0.0);
-                let second = frame.get(1).copied().unwrap_or(first);
-                left.push(first);
-                right.push(second);
-            }
+            let first = frame.first().copied().unwrap_or(0.0);
+            let second = frame.get(1).copied().unwrap_or(first);
+            left.push(first);
+            right.push(second);
         }
         if trimmed {
             break;
@@ -204,8 +200,8 @@ impl SampleData {
             let spans = slice::slices_for_sensitivity(&analysis, frames, sample_rate, sensitivity);
             let infos = spans
                 .into_iter()
-                .map(|(start, end)| slice_info(&left, &right, start, end, sample_rate))
-                .filter(|info| info.end > info.start + 1)
+                .map(|(start, end)| features::measure(&left, &right, start, end, sample_rate))
+                .filter(|info| info.end.saturating_sub(info.start) >= MIN_SLICE_SAMPLES)
                 .collect();
             buckets.push(infos);
         }
@@ -238,97 +234,8 @@ impl SampleData {
     }
 }
 
-fn slice_info(
-    left: &[f32],
-    right: &[f32],
-    start: usize,
-    end: usize,
-    sample_rate: f32,
-) -> SliceInfo {
-    let end = end.min(left.len()).min(right.len());
-    let start = start.min(end);
-    let rate = sample_rate.max(1.0);
-    // Two one-pole splits, updated in the same pass as peak and zero crossings.
-    let low_coef = one_pole_coef(180.0, rate);
-    let high_coef = one_pole_coef(4_500.0, rate);
-
-    let mut peak = 0.0f32;
-    let mut sum = 0.0f64;
-    let mut low_energy = 0.0f64;
-    let mut mid_energy = 0.0f64;
-    let mut high_energy = 0.0f64;
-    let mut low = 0.0f32;
-    let mut body = 0.0f32;
-    let mut crossings = 0usize;
-    let mut previous = 0.0f32;
-    let span = end.saturating_sub(start).max(1);
-
-    for index in start..end {
-        let sample = 0.5 * (left[index] + right[index]);
-        low += low_coef * (sample - low);
-        body += high_coef * (sample - body);
-        let high = sample - body;
-        let mid = body - low;
-        low_energy += f64::from(low) * f64::from(low);
-        mid_energy += f64::from(mid) * f64::from(mid);
-        high_energy += f64::from(high) * f64::from(high);
-
-        peak = peak.max(left[index].abs()).max(right[index].abs());
-        sum += f64::from(sample) * f64::from(sample);
-        if index > start && previous.signum() != sample.signum() && sample.abs() > 1.0e-5 {
-            crossings += 1;
-        }
-        previous = sample;
-    }
-
-    let total = low_energy + mid_energy + high_energy;
-    let (low_ratio, mid_ratio, high_ratio) = if total > 1.0e-12 {
-        (
-            (low_energy / total) as f32,
-            (mid_energy / total) as f32,
-            (high_energy / total) as f32,
-        )
-    } else {
-        (0.0, 0.0, 0.0)
-    };
-    let rms = (sum / span as f64).sqrt() as f32;
-    let zcr = crossings as f32 / span as f32;
-    // Zero crossings catch a short bright click; the high band catches a noisy hat.
-    let brightness = (0.65 * high_ratio + 0.35 * (zcr / 0.08).clamp(0.0, 1.0)).clamp(0.0, 1.0);
-    let punch = if rms > 1.0e-6 { peak / rms } else { 1.0 };
-    let norm_gain = if peak < 1.0e-4 {
-        1.0
-    } else {
-        (0.9 / peak).clamp(0.2, 4.0)
-    };
-    SliceInfo {
-        start,
-        end,
-        peak,
-        rms,
-        brightness,
-        punch,
-        norm_gain,
-        low_ratio,
-        mid_ratio,
-        high_ratio,
-        seconds: span as f32 / rate,
-    }
-}
-
-fn one_pole_coef(hz: f32, sample_rate: f32) -> f32 {
-    let hz = hz.clamp(1.0, sample_rate * 0.45);
-    1.0 - (-std::f32::consts::TAU * hz / sample_rate).exp()
-}
-
 fn waveform_peaks(left: &[f32], right: &[f32]) -> Vec<WaveformPeak> {
-    let mut peaks = vec![
-        WaveformPeak {
-            min: 0.0,
-            max: 0.0
-        };
-        WAVEFORM_COLUMNS
-    ];
+    let mut peaks = vec![WaveformPeak { min: 0.0, max: 0.0 }; WAVEFORM_COLUMNS];
     let frames = left.len().min(right.len());
     if frames == 0 {
         return peaks;

@@ -1,30 +1,38 @@
 //! Basic controls: import, waveform, pattern, and the loop macros.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
 
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use nice_plug::context::gui::GuiContext;
 use nice_plug::prelude::*;
 use nice_plug_egui::{NiceEguiApp, widgets};
 
-use crate::pattern::{Pattern, LANES};
-use crate::sample::SampleData;
+use crate::features::SliceInfo;
+use crate::params::{SEED_MAX, SEED_MIN, SonomoriParams};
+use crate::sample::{self, IMPORT_EXTENSIONS, SampleData};
+use crate::score::{Lane, Pattern};
+use crate::session::{LoadStatus, METER_ACTIVE, Shared, Snapshot};
 use crate::slice::sensitivity_bucket;
-use crate::{LoadStatus, Shared, Snapshot};
 
-const LANE_COLORS: [Color32; LANES] = [
-    Color32::from_rgb(232, 168, 74),
-    Color32::from_rgb(224, 92, 78),
-    Color32::from_rgb(86, 196, 184),
-    Color32::from_rgb(164, 124, 214),
-];
-const LANE_NAMES: [&str; LANES] = ["Low", "Mid", "High", "Extra"];
+fn lane_color(lane: Lane) -> Color32 {
+    match lane {
+        Lane::Low => Color32::from_rgb(232, 168, 74),
+        Lane::Mid => Color32::from_rgb(224, 92, 78),
+        Lane::High => Color32::from_rgb(86, 196, 184),
+        Lane::Extra => Color32::from_rgb(164, 124, 214),
+    }
+}
 
-struct OpenEditorState {
-    nice_gui_ctx: GuiContext,
+fn lane_name(lane: Lane) -> &'static str {
+    match lane {
+        Lane::Low => "Low",
+        Lane::Mid => "Mid",
+        Lane::High => "High",
+        Lane::Extra => "Extra",
+    }
 }
 
 struct LoadFinished {
@@ -33,8 +41,8 @@ struct LoadFinished {
 }
 
 pub struct SonomoriEditor {
-    open_state: Option<OpenEditorState>,
-    params: Arc<crate::SonomoriParams>,
+    gui: Option<GuiContext>,
+    params: Arc<SonomoriParams>,
     shared: Shared,
     preview_tx: rtrb::Producer<u32>,
     snapshot: triple_buffer::Output<Snapshot>,
@@ -51,7 +59,7 @@ pub struct SonomoriEditor {
 
 impl SonomoriEditor {
     pub(crate) fn new(
-        params: Arc<crate::SonomoriParams>,
+        params: Arc<SonomoriParams>,
         shared: Shared,
         preview_tx: rtrb::Producer<u32>,
         snapshot: triple_buffer::Output<Snapshot>,
@@ -60,7 +68,7 @@ impl SonomoriEditor {
         let (import_tx, import_rx) = mpsc::channel();
         let path_input = params.sample_path.lock().clone();
         Self {
-            open_state: None,
+            gui: None,
             params,
             shared,
             preview_tx,
@@ -86,11 +94,10 @@ impl SonomoriEditor {
                 Ok(data) => {
                     *self.params.sample_path.lock() = data.path.clone();
                     self.path_input = data.path.clone();
-                    self.shared.sample.store(Some(Arc::new(data)));
-                    *self.shared.status.lock() = LoadStatus::Idle;
+                    self.shared.store_sample(data);
                 }
                 Err(message) => {
-                    *self.shared.status.lock() = LoadStatus::Failed { message };
+                    self.shared.set_status(LoadStatus::Failed { message });
                 }
             }
         }
@@ -101,7 +108,7 @@ impl SonomoriEditor {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "audio".to_string());
-        *self.shared.status.lock() = LoadStatus::Loading { name };
+        self.shared.set_status(LoadStatus::Loading { name });
         let id = self.next_load_id;
         self.next_load_id = self.next_load_id.wrapping_add(1);
         self.active_load_id = id;
@@ -133,12 +140,12 @@ impl NiceEguiApp for SonomoriEditor {
         egui_ctx.style_mut_of(egui::Theme::Dark, |style| {
             style.spacing.item_spacing = Vec2::new(8.0, 6.0);
         });
-        self.open_state = Some(OpenEditorState { nice_gui_ctx });
+        self.gui = Some(nice_gui_ctx);
         Ok(())
     }
 
     fn editor_closed(&mut self) {
-        self.open_state = None;
+        self.gui = None;
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut nice_plug_egui::Frame) {
@@ -150,7 +157,7 @@ impl NiceEguiApp for SonomoriEditor {
         let mut request_import = false;
         draw(
             ui,
-            &self.open_state,
+            &self.gui,
             &self.params,
             &self.shared,
             &mut self.preview_tx,
@@ -184,7 +191,7 @@ fn open_import_dialog(tx: Sender<Option<PathBuf>>) {
     let show = move || {
         let path = rfd::FileDialog::new()
             .set_title("Import a sound")
-            .add_filter("Audio", &["wav", "mp3", "flac", "ogg", "aac", "m4a"])
+            .add_filter("Audio", IMPORT_EXTENSIONS)
             .pick_file();
         let _ = tx.send(path);
     };
@@ -197,8 +204,8 @@ fn open_import_dialog(tx: Sender<Option<PathBuf>>) {
 
 fn draw(
     ui: &mut egui::Ui,
-    open_state: &Option<OpenEditorState>,
-    params: &crate::SonomoriParams,
+    gui: &Option<GuiContext>,
+    params: &SonomoriParams,
     shared: &Shared,
     preview_tx: &mut rtrb::Producer<u32>,
     path_input: &mut String,
@@ -209,10 +216,10 @@ fn draw(
     import_open: bool,
     request_import: &mut bool,
 ) {
-    let Some(state) = open_state.as_ref() else {
+    let Some(gui) = gui.as_ref() else {
         return;
     };
-    let setter = state.nice_gui_ctx.param_setter();
+    let setter = gui.param_setter();
     let bucket = sensitivity_bucket(params.sensitivity.value());
     let slices = sample
         .as_ref()
@@ -258,13 +265,13 @@ fn draw(
         if ui.button(label).clicked() {
             shared.audition.store(!audition, Ordering::Relaxed);
         }
-        if snapshot.host_playing {
-            ui.label(format!("Host is playing at {:.1} BPM", snapshot.bpm));
+        if snapshot.clock.host_playing {
+            ui.label(format!("Host is playing at {:.1} BPM", snapshot.clock.bpm));
         } else if audition {
             ui.label(format!(
                 "{} at {:.1} BPM",
                 if standalone { "Playing" } else { "Audition" },
-                snapshot.bpm
+                snapshot.clock.bpm
             ));
         } else if standalone {
             ui.label("Press Play to start the loop.");
@@ -287,18 +294,15 @@ fn draw(
         }
     });
 
-    ui.label(status_line(
-        shared,
-        sample.as_deref(),
-        slices.len(),
-    ));
+    ui.label(status_line(shared, sample.as_deref(), slices.len()));
 
     if let Some(loaded) = sample.as_ref() {
         paint_waveform(ui, loaded, slices, snapshot, preview_tx);
     } else {
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 110.0), Sense::hover());
-        ui.painter().rect_filled(rect, 4.0, Color32::from_rgb(22, 24, 28));
+        ui.painter()
+            .rect_filled(rect, 4.0, Color32::from_rgb(22, 24, 28));
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -368,7 +372,7 @@ fn draw(
     );
 
     if snapshot.playing
-        || meter > 0.001
+        || meter > METER_ACTIVE
         || import_open
         || matches!(*shared.status.lock(), LoadStatus::Loading { .. })
     {
@@ -381,16 +385,21 @@ fn add_slider<P: Param>(ui: &mut egui::Ui, label: &str, param: &P, setter: &Para
     ui.add(widgets::ParamSlider::for_param(param, setter).with_width(ui.available_width()));
 }
 
-fn randomize(setter: &ParamSetter<'_>, params: &crate::SonomoriParams, undo_seed: &mut Option<i32>) {
+fn randomize(setter: &ParamSetter<'_>, params: &SonomoriParams, undo_seed: &mut Option<i32>) {
     let current = params.seed.value();
     *undo_seed = Some(current);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(1);
-    let mut next = (nanos % 999_999) as i32 + 1;
+    let span = (SEED_MAX - SEED_MIN + 1) as u128;
+    let mut next = (nanos % span) as i32 + SEED_MIN;
     if next == current {
-        next = if current >= 999_999 { 1 } else { current + 1 };
+        next = if current >= SEED_MAX {
+            SEED_MIN
+        } else {
+            current + 1
+        };
     }
     set_int(setter, &params.seed, next);
 }
@@ -408,17 +417,13 @@ fn status_line(shared: &Shared, sample: Option<&SampleData>, slice_count: usize)
         LoadStatus::Failed { message } => message.clone(),
         LoadStatus::Idle => match sample {
             Some(loaded) => {
-                let trimmed = if loaded.trimmed {
-                    "  ·  using the first 30 seconds"
-                } else {
-                    ""
-                };
+                let trimmed = sample::trimmed_note(loaded.trimmed);
                 format!(
                     "{}  ·  {} slices  ·  {:.1}s{trimmed}",
                     loaded.name, slice_count, loaded.seconds
                 )
             }
-            None => "Import a WAV, MP3, FLAC, OGG, AAC, or M4A file. Longer files use the first 30 seconds.".into(),
+            None => sample::idle_hint(),
         },
     }
 }
@@ -426,7 +431,7 @@ fn status_line(shared: &Shared, sample: Option<&SampleData>, slice_count: usize)
 fn paint_waveform(
     ui: &mut egui::Ui,
     sample: &SampleData,
-    slices: &[crate::sample::SliceInfo],
+    slices: &[SliceInfo],
     snapshot: &Snapshot,
     preview_tx: &mut rtrb::Producer<u32>,
 ) {
@@ -438,17 +443,18 @@ fn paint_waveform(
         return;
     }
 
-    for (lane, lane_pattern) in snapshot.pattern.lanes.iter().enumerate() {
-        let Some(slice) = slices.get(lane_pattern.slice) else {
+    for lane in Lane::ALL {
+        let played = &snapshot.pattern.lanes[lane.index()];
+        if played.end <= played.start {
             continue;
-        };
-        let start_x = rect.left() + rect.width() * slice.start as f32 / sample.len() as f32;
-        let end_x = rect.left() + rect.width() * slice.end as f32 / sample.len() as f32;
+        }
+        let start_x = rect.left() + rect.width() * played.start as f32 / sample.len() as f32;
+        let end_x = rect.left() + rect.width() * played.end as f32 / sample.len() as f32;
         let region = Rect::from_min_max(
             Pos2::new(start_x, rect.top()),
             Pos2::new(end_x.max(start_x + 1.0), rect.bottom()),
         );
-        painter.rect_filled(region, 0.0, LANE_COLORS[lane].gamma_multiply(0.28));
+        painter.rect_filled(region, 0.0, lane_color(lane).gamma_multiply(0.28));
     }
 
     let mid_y = rect.center().y;
@@ -489,11 +495,11 @@ fn paint_waveform(
 fn paint_pattern(ui: &mut egui::Ui, snapshot: &Snapshot) {
     let pattern: &Pattern = &snapshot.pattern;
     let steps = pattern.steps.max(1);
-    for lane in 0..LANES {
+    for lane in Lane::ALL {
         ui.horizontal(|ui| {
             let (swatch, _) = ui.allocate_exact_size(Vec2::new(10.0, 10.0), Sense::hover());
-            ui.painter().rect_filled(swatch, 2.0, LANE_COLORS[lane]);
-            ui.label(LANE_NAMES[lane]);
+            ui.painter().rect_filled(swatch, 2.0, lane_color(lane));
+            ui.label(lane_name(lane));
         });
         let width = ui.available_width();
         let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 18.0), Sense::hover());
@@ -505,9 +511,9 @@ fn paint_pattern(ui: &mut egui::Ui, snapshot: &Snapshot) {
                 Pos2::new(x + 1.0, rect.top()),
                 Vec2::new((cell - 2.0).max(1.0), rect.height()),
             );
-            let velocity = pattern.lanes[lane].velocity[step];
+            let velocity = pattern.lanes[lane.index()].velocity[step];
             let color = if velocity > 0.0 {
-                LANE_COLORS[lane].gamma_multiply(0.35 + 0.65 * velocity)
+                lane_color(lane).gamma_multiply(0.35 + 0.65 * velocity)
             } else {
                 Color32::from_rgb(38, 40, 46)
             };

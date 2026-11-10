@@ -4,11 +4,10 @@
 //! timeline when it is playing, in sixteenth notes, with a swing ratio that
 //! delays every other sixteenth.
 
-use crate::pattern::{Pattern, LANES, MAX_STEPS};
-use crate::sample::SampleData;
+use crate::score::{
+    LANES, Lane, MAX_STEPS, MIN_SLICE_SAMPLES, Pattern, STEPS_PER_BEAT, SWING_MAX, SWING_MIN,
+};
 
-const VOICES: usize = LANES + 1;
-const PREVIEW: usize = LANES;
 const ATTACK_SAMPLES: u32 = 16;
 const END_FADE_SAMPLES: f64 = 64.0;
 
@@ -61,31 +60,42 @@ impl DcBlock {
         let output = input - self.x1 + 0.995 * self.y1;
         self.x1 = input;
         self.y1 = output;
-        if output.abs() < 1.0e-20 {
-            0.0
-        } else {
-            output
-        }
+        if output.abs() < 1.0e-20 { 0.0 } else { output }
     }
 }
 
 pub struct Engine {
     sample_rate: f32,
-    voices: [Voice; VOICES],
+    voices: [Voice; LANES],
+    /// Click-to-preview ignores the transport fade. The lane voices do not.
+    preview: Voice,
     last_step: Option<usize>,
     stop_env: f32,
     dc_l: DcBlock,
     dc_r: DcBlock,
-    pub current_step: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Audio<'a> {
+    pub sample_rate: f32,
+    pub left: &'a [f32],
+    pub right: &'a [f32],
+}
+
+#[derive(Clone, Copy)]
+pub struct Preview {
+    pub start: usize,
+    pub end: usize,
+    pub norm_gain: f32,
 }
 
 pub struct FrameInput<'a> {
-    pub sample: Option<&'a SampleData>,
+    pub audio: Option<Audio<'a>>,
     pub pattern: &'a Pattern,
     pub playing: bool,
     pub beats: f64,
     pub swing: f32,
-    pub preview_slice: Option<usize>,
+    pub preview: Option<Preview>,
     pub gain: f32,
 }
 
@@ -93,12 +103,12 @@ impl Engine {
     pub fn new(sample_rate: f32) -> Self {
         Self {
             sample_rate: sample_rate.max(1.0),
-            voices: [Voice::default(); VOICES],
+            voices: [Voice::default(); LANES],
+            preview: Voice::default(),
             last_step: None,
             stop_env: 0.0,
             dc_l: DcBlock::default(),
             dc_r: DcBlock::default(),
-            current_step: None,
         }
     }
 
@@ -107,12 +117,12 @@ impl Engine {
     }
 
     pub fn reset(&mut self) {
-        self.voices = [Voice::default(); VOICES];
+        self.voices = [Voice::default(); LANES];
+        self.preview = Voice::default();
         self.last_step = None;
         self.stop_env = 0.0;
         self.dc_l = DcBlock::default();
         self.dc_r = DcBlock::default();
-        self.current_step = None;
     }
 
     /// Forget the last triggered step so the next playing sample fires again.
@@ -121,7 +131,7 @@ impl Engine {
     }
 
     pub fn any_active(&self) -> bool {
-        self.voices.iter().any(|voice| voice.active) || self.stop_env > 0.0
+        self.voices.iter().any(|voice| voice.active) || self.preview.active || self.stop_env > 0.0
     }
 
     pub fn frame(&mut self, input: FrameInput<'_>) -> (f32, f32) {
@@ -131,7 +141,7 @@ impl Engine {
         } else {
             self.stop_env = (self.stop_env - fade_step).max(0.0);
             if self.stop_env == 0.0 {
-                for voice in &mut self.voices[..LANES] {
+                for voice in &mut self.voices {
                     voice.active = false;
                 }
                 self.last_step = None;
@@ -139,35 +149,29 @@ impl Engine {
         }
 
         let steps = input.pattern.steps.clamp(1, MAX_STEPS);
-        let step = step_at(input.beats, input.swing as f64, steps);
         if input.playing {
-            let changed = self.last_step != Some(step);
-            if changed {
-                self.trigger_step(input.sample, input.pattern, step);
+            let step = step_at(input.beats, input.swing as f64, steps);
+            if self.last_step != Some(step) {
+                self.trigger_step(input.audio, input.pattern, step);
                 self.last_step = Some(step);
             }
-            self.current_step = Some(step);
-        } else {
-            self.current_step = None;
         }
 
-        if let Some(slice_index) = input.preview_slice {
-            self.trigger_preview(input.sample, input.pattern.bucket, slice_index);
+        if let Some(preview) = input.preview {
+            self.trigger_preview(input.audio, preview);
         }
 
         let mut left = 0.0f32;
         let mut right = 0.0f32;
-        if let Some(sample) = input.sample {
-            for (index, voice) in self.voices.iter_mut().enumerate() {
-                let (voice_l, voice_r) = voice.render(sample);
-                if index == PREVIEW {
-                    left += voice_l;
-                    right += voice_r;
-                } else {
-                    left += voice_l * self.stop_env;
-                    right += voice_r * self.stop_env;
-                }
+        if let Some(audio) = input.audio {
+            for voice in &mut self.voices {
+                let (voice_l, voice_r) = voice.render(audio);
+                left += voice_l * self.stop_env;
+                right += voice_r * self.stop_env;
             }
+            let (preview_l, preview_r) = self.preview.render(audio);
+            left += preview_l;
+            right += preview_r;
         }
 
         left = soft_clip(self.dc_l.process(left) * input.gain);
@@ -175,54 +179,42 @@ impl Engine {
         (left, right)
     }
 
-    fn trigger_step(&mut self, sample: Option<&SampleData>, pattern: &Pattern, step: usize) {
-        let Some(sample) = sample else {
+    fn trigger_step(&mut self, audio: Option<Audio<'_>>, pattern: &Pattern, step: usize) {
+        let Some(audio) = audio else {
             return;
         };
-        let Some(slices) = sample.buckets.get(pattern.bucket) else {
-            return;
-        };
-        for lane in 0..LANES {
-            let velocity = pattern.lanes[lane].velocity[step];
+        for lane in Lane::ALL {
+            let played = &pattern.lanes[lane.index()];
+            let velocity = played.velocity[step];
             if velocity <= 0.0 {
                 continue;
             }
-            let Some(slice) = slices.get(pattern.lanes[lane].slice) else {
-                continue;
-            };
-            self.voices[lane].trigger(
-                sample,
-                slice.start,
-                slice.end,
-                pattern.lanes[lane].pitch,
-                pattern.lanes[lane].decay,
-                pattern.lanes[lane].tone,
-                pattern.lanes[lane].gain * slice.norm_gain * velocity,
-                pattern.lanes[lane].pan,
+            self.voices[lane.index()].trigger(
+                audio,
+                played.start,
+                played.end,
+                played.pitch,
+                played.decay,
+                played.tone,
+                played.gain * played.norm_gain * velocity,
+                played.pan,
                 self.sample_rate,
             );
         }
     }
 
-    fn trigger_preview(&mut self, sample: Option<&SampleData>, bucket: usize, slice_index: usize) {
-        let Some(sample) = sample else {
+    fn trigger_preview(&mut self, audio: Option<Audio<'_>>, preview: Preview) {
+        let Some(audio) = audio else {
             return;
         };
-        let Some(slice) = sample
-            .buckets
-            .get(bucket)
-            .and_then(|slices| slices.get(slice_index))
-        else {
-            return;
-        };
-        self.voices[PREVIEW].trigger(
-            sample,
-            slice.start,
-            slice.end,
+        self.preview.trigger(
+            audio,
+            preview.start,
+            preview.end,
             0.0,
             0.7,
             1.0,
-            slice.norm_gain,
+            preview.norm_gain,
             0.0,
             self.sample_rate,
         );
@@ -232,7 +224,7 @@ impl Engine {
 impl Voice {
     fn trigger(
         &mut self,
-        sample: &SampleData,
+        audio: Audio<'_>,
         start: usize,
         end: usize,
         pitch: f32,
@@ -242,19 +234,22 @@ impl Voice {
         pan: f32,
         host_rate: f32,
     ) {
-        let end = end.min(sample.len());
-        if end.saturating_sub(start) < 2 || host_rate <= 0.0 || sample.sample_rate <= 0.0 {
+        let end = end.min(audio.left.len()).min(audio.right.len());
+        if end.saturating_sub(start) < MIN_SLICE_SAMPLES
+            || host_rate <= 0.0
+            || audio.sample_rate <= 0.0
+        {
             self.active = false;
             return;
         }
         let ratio = 2.0f64.powf((pitch as f64) / 12.0);
         self.pos = start as f64;
         self.end = end;
-        self.increment = (sample.sample_rate as f64 / host_rate as f64) * ratio;
+        self.increment = (audio.sample_rate as f64 / host_rate as f64) * ratio;
         self.increment = self.increment.clamp(0.05, 16.0);
         self.env = 0.0;
         self.attack_left = ATTACK_SAMPLES;
-        let slice_seconds = (end - start) as f32 / sample.sample_rate;
+        let slice_seconds = (end - start) as f32 / audio.sample_rate;
         let seconds = (0.045 + decay * decay * 1.35).min(slice_seconds.max(0.045));
         let samples = (seconds * host_rate).max(1.0);
         self.decay = 0.001f32.powf(1.0 / samples);
@@ -269,11 +264,11 @@ impl Voice {
         self.active = true;
     }
 
-    fn render(&mut self, sample: &SampleData) -> (f32, f32) {
+    fn render(&mut self, audio: Audio<'_>) -> (f32, f32) {
         if !self.active {
             return (0.0, 0.0);
         }
-        let limit = self.end.min(sample.len());
+        let limit = self.end.min(audio.left.len()).min(audio.right.len());
         if self.pos + 1.0 >= limit as f64 {
             self.active = false;
             return (0.0, 0.0);
@@ -282,12 +277,12 @@ impl Voice {
         let index = self.pos as usize;
         let frac = (self.pos - index as f64) as f32;
         let next = index + 1;
-        if next >= sample.left.len() || next >= sample.right.len() {
+        if next >= audio.left.len() || next >= audio.right.len() {
             self.active = false;
             return (0.0, 0.0);
         }
-        let left = sample.left[index] * (1.0 - frac) + sample.left[next] * frac;
-        let right = sample.right[index] * (1.0 - frac) + sample.right[next] * frac;
+        let left = audio.left[index] * (1.0 - frac) + audio.left[next] * frac;
+        let right = audio.right[index] * (1.0 - frac) + audio.right[next] * frac;
         self.pos += self.increment;
 
         if self.attack_left > 0 {
@@ -318,7 +313,10 @@ impl Voice {
         }
 
         let level = self.env * end_fade * self.gain * 0.45;
-        (self.lp_l * level * self.pan_l, self.lp_r * level * self.pan_r)
+        (
+            self.lp_l * level * self.pan_l,
+            self.lp_r * level * self.pan_r,
+        )
     }
 }
 
@@ -326,14 +324,14 @@ impl Voice {
 /// 0.5 is straight. Higher values delay the off-sixteenth.
 pub fn step_at(beats: f64, swing: f64, steps: usize) -> usize {
     let steps = steps.max(1);
-    let pattern_beats = steps as f64 / 4.0;
+    let pattern_beats = steps as f64 / STEPS_PER_BEAT as f64;
     let phase = beats.rem_euclid(pattern_beats);
-    let eighths = phase * 2.0;
+    let eighths = phase * (STEPS_PER_BEAT as f64 / 2.0);
     let pair = eighths.floor() as usize;
     let frac = eighths - pair as f64;
-    let swing = swing.clamp(0.5, 0.8);
+    let swing = swing.clamp(f64::from(SWING_MIN), f64::from(SWING_MAX));
     let step_in_pair = if frac < swing { 0 } else { 1 };
-    (pair * 2 + step_in_pair).min(steps - 1)
+    (pair * (STEPS_PER_BEAT / 2) + step_in_pair).min(steps - 1)
 }
 
 fn lowpass_coef(tone: f32, sample_rate: f32) -> f32 {
@@ -353,8 +351,8 @@ fn soft_clip(sample: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pattern::{LanePattern, Pattern, LANES};
     use crate::sample::SampleData;
+    use crate::score::{LANES, LanePattern, Pattern};
     use crate::slice::sensitivity_bucket;
 
     #[test]
@@ -391,14 +389,17 @@ mod tests {
             false,
         );
         let bucket = sensitivity_bucket(0.5);
-        assert!(!sample.buckets[bucket].is_empty());
+        let slice = &sample.buckets[bucket][0];
+        assert!(slice.end > slice.start + 1);
 
         let mut pattern = Pattern {
             steps: 16,
-            bucket,
             lanes: [LanePattern::default(); LANES],
         };
         pattern.lanes[0].slice = 0;
+        pattern.lanes[0].start = slice.start;
+        pattern.lanes[0].end = slice.end;
+        pattern.lanes[0].norm_gain = slice.norm_gain;
         pattern.lanes[0].velocity[4] = 1.0;
         pattern.lanes[0].gain = 1.0;
         pattern.lanes[0].decay = 0.8;
@@ -410,17 +411,22 @@ mod tests {
         let mut right = vec![0.0f32; frames];
         let block = 64;
         let mut rendered = 0;
+        let audio = Audio {
+            sample_rate,
+            left: &sample.left,
+            right: &sample.right,
+        };
         while rendered < frames {
             let count = block.min(frames - rendered);
             for index in 0..count {
                 let beats = (rendered + index) as f64 / f64::from(sample_rate) * 120.0 / 60.0;
                 let (l, r) = engine.frame(FrameInput {
-                    sample: Some(&sample),
+                    audio: Some(audio),
                     pattern: &pattern,
                     playing: true,
                     beats,
                     swing: 0.5,
-                    preview_slice: None,
+                    preview: None,
                     gain: 1.0,
                 });
                 left[rendered + index] = l;
@@ -440,7 +446,11 @@ mod tests {
             around_downbeat < around_hit * 0.25,
             "downbeat {around_downbeat} should stay quieter than the hit {around_hit}"
         );
-        assert!(left.iter().chain(right.iter()).all(|sample| sample.is_finite()));
+        assert!(
+            left.iter()
+                .chain(right.iter())
+                .all(|sample| sample.is_finite())
+        );
     }
 
     fn peak_around(buffer: &[f32], start: usize, end: usize) -> f32 {

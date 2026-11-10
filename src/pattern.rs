@@ -8,63 +8,15 @@
 //! alike. Low prefers a kick-like hit, Mid a snare-like hit, High a hat-like
 //! hit. The seed only chooses among slices that already fit that lane.
 
-use crate::sample::SliceInfo;
-use crate::slice::MAX_SLICES;
-
-pub const LANES: usize = 4;
-pub const STEPS_PER_BAR: usize = 16;
-pub const MAX_STEPS: usize = STEPS_PER_BAR * 2;
-
-pub const LANE_LOW: usize = 0;
-pub const LANE_MID: usize = 1;
-pub const LANE_HIGH: usize = 2;
-pub const LANE_EXTRA: usize = 3;
+use crate::features::{self, MAX_SLICES, Role, RoleScores, SliceInfo};
+use crate::score::{
+    BARS_MAX, BARS_MIN, BEATS_PER_BAR, HALF_BAR, LANES, Lane, Pattern, STEPS_PER_BAR,
+    STEPS_PER_BEAT,
+};
 
 const LANE_GAIN: [f32; LANES] = [1.0, 0.92, 0.52, 0.7];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct LanePattern {
-    pub velocity: [f32; MAX_STEPS],
-    pub slice: usize,
-    pub pitch: f32,
-    pub decay: f32,
-    pub tone: f32,
-    pub gain: f32,
-    pub pan: f32,
-}
-
-impl Default for LanePattern {
-    fn default() -> Self {
-        Self {
-            velocity: [0.0; MAX_STEPS],
-            slice: 0,
-            pitch: 0.0,
-            decay: 0.55,
-            tone: 0.8,
-            gain: 1.0,
-            pan: 0.0,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Pattern {
-    pub lanes: [LanePattern; LANES],
-    pub steps: usize,
-    pub bucket: usize,
-}
-
-impl Default for Pattern {
-    fn default() -> Self {
-        Self {
-            lanes: [LanePattern::default(); LANES],
-            steps: STEPS_PER_BAR,
-            bucket: 0,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
 pub struct GenParams {
     pub seed: u32,
     pub density: f32,
@@ -76,7 +28,27 @@ pub struct GenParams {
     pub pitch: f32,
     pub tone: f32,
     pub bars: usize,
-    pub bucket: usize,
+}
+
+/// Collapse knob noise so the cache misses only when a macro actually moves.
+///
+/// Fields left untouched by the struct update are compared exactly, so a new
+/// field participates in the key without a second list.
+pub fn cache_key(params: &GenParams) -> GenParams {
+    GenParams {
+        density: quantize_unit(params.density),
+        syncopation: quantize_unit(params.syncopation),
+        symmetry: quantize_unit(params.symmetry),
+        sound_var: quantize_unit(params.sound_var),
+        pattern_var: quantize_unit(params.pattern_var),
+        decay: quantize_unit(params.decay),
+        tone: quantize_unit(params.tone),
+        ..*params
+    }
+}
+
+fn quantize_unit(value: f32) -> f32 {
+    (value * 1000.0).round() / 1000.0
 }
 
 impl Default for GenParams {
@@ -92,13 +64,12 @@ impl Default for GenParams {
             pitch: 0.0,
             tone: 0.75,
             bars: 1,
-            bucket: 0,
         }
     }
 }
 
 pub fn generate(slices: &[SliceInfo], params: &GenParams) -> Pattern {
-    let bars = params.bars.clamp(1, 2);
+    let bars = params.bars.clamp(BARS_MIN, BARS_MAX);
     let steps = bars * STEPS_PER_BAR;
     let density = params.density.clamp(0.0, 1.0);
     let sync = params.syncopation.clamp(-1.0, 1.0);
@@ -108,15 +79,19 @@ pub fn generate(slices: &[SliceInfo], params: &GenParams) -> Pattern {
 
     let mut pattern = Pattern {
         steps,
-        bucket: params.bucket,
         ..Pattern::default()
     };
 
     let chosen = pick_slices(slices, params.seed);
-    for lane in 0..LANES {
-        let lane_pattern = &mut pattern.lanes[lane];
-        lane_pattern.slice = chosen[lane];
-        lane_pattern.gain = LANE_GAIN[lane];
+    for lane in Lane::ALL {
+        let index = lane.index();
+        let lane_pattern = &mut pattern.lanes[index];
+        let slice = slices.get(chosen[index]);
+        lane_pattern.slice = chosen[index];
+        lane_pattern.start = slice.map(|slice| slice.start).unwrap_or(0);
+        lane_pattern.end = slice.map(|slice| slice.end).unwrap_or(0);
+        lane_pattern.norm_gain = slice.map(|slice| slice.norm_gain).unwrap_or(1.0);
+        lane_pattern.gain = LANE_GAIN[index];
         lane_pattern.pitch = lane_pitch(params.seed, lane, params.pitch, sound_var);
         lane_pattern.decay = lane_decay(params.seed, lane, params.decay, sound_var);
         lane_pattern.tone = lane_tone(params.seed, lane, params.tone, sound_var);
@@ -124,36 +99,48 @@ pub fn generate(slices: &[SliceInfo], params: &GenParams) -> Pattern {
     }
 
     for bar in 0..bars {
-        for step in 0..8 {
+        for step in 0..HALF_BAR {
             let index = bar * STEPS_PER_BAR + step;
-            write_step(&mut pattern, params.seed, bar, step, index, density, sync, pattern_var);
+            write_step(
+                &mut pattern,
+                params.seed,
+                bar,
+                step,
+                index,
+                density,
+                sync,
+                pattern_var,
+            );
         }
-        for step in 8..STEPS_PER_BAR {
+        for step in HALF_BAR..STEPS_PER_BAR {
             let index = bar * STEPS_PER_BAR + step;
-            let source = bar * STEPS_PER_BAR + (step - 8);
-            for lane in 0..LANES {
+            let source = bar * STEPS_PER_BAR + (step - HALF_BAR);
+            for lane in Lane::ALL {
+                let lane_index = lane.index();
                 let copy = symmetry >= 0.999
-                    || hash01(params.seed, 80 + lane as u32, index as u32)
+                    || hash01(params.seed, 80 + lane_index as u32, index as u32)
                         < symmetry * (1.0 - pattern_var * 0.35);
                 if copy {
-                    pattern.lanes[lane].velocity[index] = pattern.lanes[lane].velocity[source];
+                    pattern.lanes[lane_index].velocity[index] =
+                        pattern.lanes[lane_index].velocity[source];
                 } else {
-                    pattern.lanes[lane].velocity[index] =
+                    pattern.lanes[lane_index].velocity[index] =
                         hit(params.seed, lane, bar, step, density, sync, pattern_var);
                 }
             }
         }
     }
 
-    if bars == 2 {
+    for bar in 1..bars {
         for step in 0..STEPS_PER_BAR {
-            for lane in 0..LANES {
+            for lane in Lane::ALL {
+                let lane_index = lane.index();
                 let keep = pattern_var <= 0.001
-                    || hash01(params.seed, 120 + lane as u32, step as u32)
+                    || hash01(params.seed, 120 + lane_index as u32, step as u32)
                         < (1.0 - pattern_var);
                 if keep {
-                    pattern.lanes[lane].velocity[STEPS_PER_BAR + step] =
-                        pattern.lanes[lane].velocity[step];
+                    pattern.lanes[lane_index].velocity[bar * STEPS_PER_BAR + step] =
+                        pattern.lanes[lane_index].velocity[step];
                 }
             }
         }
@@ -172,61 +159,70 @@ fn write_step(
     sync: f32,
     pattern_var: f32,
 ) {
-    for lane in 0..LANES {
-        pattern.lanes[lane].velocity[index] =
+    for lane in Lane::ALL {
+        pattern.lanes[lane.index()].velocity[index] =
             hit(seed, lane, bar, step, density, sync, pattern_var);
     }
 }
 
 fn hit(
     seed: u32,
-    lane: usize,
+    lane: Lane,
     bar: usize,
     step: usize,
     density: f32,
     sync: f32,
     pattern_var: f32,
 ) -> f32 {
+    let lane_index = lane.index() as u32;
     let weight = step_weight(lane, step, density, sync);
-    let jitter = (hash01(seed, 200 + lane as u32, (bar * 16 + step) as u32) - 0.5)
+    let jitter = (hash01(seed, 200 + lane_index, (bar * STEPS_PER_BAR + step) as u32) - 0.5)
         * pattern_var
         * 0.45;
     let probability = (weight + jitter).clamp(0.0, 0.98);
-    let roll = hash01(seed, 400 + lane as u32, (bar * 32 + step) as u32);
+    let roll = hash01(
+        seed,
+        400 + lane_index,
+        (bar * (STEPS_PER_BAR * 2) + step) as u32,
+    );
     if roll >= probability {
         return 0.0;
     }
     let accent = if is_accent(lane, step) { 0.82 } else { 0.48 };
-    let variation = hash01(seed, 600 + lane as u32, (bar * 16 + step) as u32);
+    let variation = hash01(seed, 600 + lane_index, (bar * STEPS_PER_BAR + step) as u32);
     (accent + variation * 0.18).clamp(0.2, 1.0)
 }
 
-fn is_accent(lane: usize, step: usize) -> bool {
+fn is_accent(lane: Lane, step: usize) -> bool {
     let pos = step % STEPS_PER_BAR;
     match lane {
-        LANE_LOW => pos % 4 == 0,
-        LANE_MID => pos == 4 || pos == 12,
-        LANE_HIGH => pos % 2 == 0,
-        _ => pos % 4 == 2,
+        Lane::Low => pos % STEPS_PER_BEAT == 0,
+        Lane::Mid => on_backbeat(pos),
+        Lane::High => pos % (STEPS_PER_BEAT / 2) == 0,
+        Lane::Extra => pos % STEPS_PER_BEAT == STEPS_PER_BEAT / 2,
     }
 }
 
+fn on_backbeat(pos: usize) -> bool {
+    pos == STEPS_PER_BEAT || pos == STEPS_PER_BEAT * (BEATS_PER_BAR - 1)
+}
+
 /// Chance that `step` (0..16 inside a bar) fires on `lane`.
-fn step_weight(lane: usize, step: usize, density: f32, sync: f32) -> f32 {
+fn step_weight(lane: Lane, step: usize, density: f32, sync: f32) -> f32 {
     let pos = step % STEPS_PER_BAR;
     let sync_pos = (sync + 1.0) * 0.5;
-    let downbeat = pos % 4 == 0;
-    let eighth_off = pos % 4 == 2;
-    let sixteenth = pos % 2 == 1;
-    let anticipation = matches!(pos, 3 | 7 | 11 | 15);
+    let downbeat = pos % STEPS_PER_BEAT == 0;
+    let eighth_off = pos % STEPS_PER_BEAT == STEPS_PER_BEAT / 2;
+    let sixteenth = pos % (STEPS_PER_BEAT / 2) == 1;
+    let anticipation = pos % STEPS_PER_BEAT == STEPS_PER_BEAT - 1;
 
     match lane {
-        LANE_LOW => {
+        Lane::Low => {
             if pos == 0 {
                 0.25 + 0.75 * density
-            } else if pos == 8 {
+            } else if pos == HALF_BAR {
                 density * (0.35 + 0.55 * (1.0 - sync_pos * 0.35))
-            } else if pos == 4 || pos == 12 {
+            } else if on_backbeat(pos) {
                 density * 0.28 * (1.0 - sync_pos * 0.5)
             } else if eighth_off {
                 density * (0.08 + 0.42 * sync_pos)
@@ -236,8 +232,8 @@ fn step_weight(lane: usize, step: usize, density: f32, sync: f32) -> f32 {
                 density * 0.05 * sync_pos
             }
         }
-        LANE_MID => {
-            if pos == 4 || pos == 12 {
+        Lane::Mid => {
+            if on_backbeat(pos) {
                 0.35 + 0.6 * density
             } else if anticipation {
                 density * (0.08 + 0.7 * sync_pos)
@@ -249,7 +245,7 @@ fn step_weight(lane: usize, step: usize, density: f32, sync: f32) -> f32 {
                 density * 0.06
             }
         }
-        LANE_HIGH => {
+        Lane::High => {
             let base = 0.08 + density * 0.88;
             if sixteenth {
                 base * (0.08 + 0.92 * sync_pos)
@@ -259,7 +255,7 @@ fn step_weight(lane: usize, step: usize, density: f32, sync: f32) -> f32 {
                 base * (0.92 - 0.55 * sync_pos)
             }
         }
-        _ => {
+        Lane::Extra => {
             let base = density * 0.42;
             if anticipation {
                 base * (0.35 + 0.9 * sync_pos)
@@ -282,12 +278,12 @@ fn pick_slices(slices: &[SliceInfo], seed: u32) -> [usize; LANES] {
 
     let mut bassiness_low = f32::MAX;
     let mut bassiness_high = f32::MIN;
-    let mut scores = [[0.0f32; 3]; MAX_SLICES];
+    let mut scores = [RoleScores::ZERO; MAX_SLICES];
     for index in 0..count {
         let bassiness = slices[index].low_ratio - slices[index].high_ratio;
         bassiness_low = bassiness_low.min(bassiness);
         bassiness_high = bassiness_high.max(bassiness);
-        scores[index] = role_scores(&slices[index]);
+        scores[index] = features::role_scores(&slices[index]);
     }
 
     // A shaker or a tone has no kick/snare/hat split. Spread the lanes across
@@ -299,57 +295,22 @@ fn pick_slices(slices: &[SliceInfo], seed: u32) -> [usize; LANES] {
     let mut used = [false; MAX_SLICES];
     let mut chosen = [0usize; LANES];
     // Kick and hat claim a slice before Mid, so the extremes stay in their lanes.
-    chosen[LANE_LOW] = pick_role(&scores, count, 0, &mut used, seed, 900);
-    chosen[LANE_HIGH] = pick_role(&scores, count, 2, &mut used, seed, 901);
-    chosen[LANE_MID] = pick_role(&scores, count, 1, &mut used, seed, 902);
-    chosen[LANE_EXTRA] = pick_role_max(&scores, count, &mut used, seed, 903);
+    chosen[Lane::Low.index()] = pick_role(&scores, count, Role::Kick, &mut used, seed, 900);
+    chosen[Lane::High.index()] = pick_role(&scores, count, Role::Hat, &mut used, seed, 901);
+    chosen[Lane::Mid.index()] = pick_role(&scores, count, Role::Snare, &mut used, seed, 902);
+    chosen[Lane::Extra.index()] = pick_role_max(&scores, count, &mut used, seed, 903);
     chosen
 }
 
-/// Kick, snare, and hat scores. Absolute, so a file full of hats does not grow
-/// a fake kick out of whichever hat is least bright.
-fn role_scores(slice: &SliceInfo) -> [f32; 3] {
-    let low = slice.low_ratio;
-    let mid = slice.mid_ratio;
-    let high = slice.high_ratio;
-    let punch = (slice.punch / 5.0).clamp(0.2, 1.0);
-    let body = length_fit(slice.seconds, 0.08, 0.85);
-    let snap = length_fit(slice.seconds, 0.04, 0.45);
-    let tick = length_fit(slice.seconds, 0.012, 0.14);
-
-    let kick = low * (0.55 + 0.45 * punch) * (0.4 + 0.6 * body) * (1.0 - high * 0.8);
-    // Mid and high together: a snare has a body and noise. A hat is almost all high.
-    let snare = (0.65 * mid + 0.35 * high * mid)
-        * (0.5 + 0.5 * punch)
-        * (0.45 + 0.55 * snap)
-        * (1.0 - low * 0.65);
-    let hat = (0.6 * high + 0.4 * slice.brightness)
-        * (0.35 + 0.65 * tick)
-        * (1.0 - low * 0.85)
-        * (1.0 - mid * 0.25);
-    [kick.max(0.0), snare.max(0.0), hat.max(0.0)]
-}
-
-/// 1 inside `[lo, hi]`, falling off outside without ever reaching zero.
-fn length_fit(seconds: f32, lo: f32, hi: f32) -> f32 {
-    if seconds >= lo && seconds <= hi {
-        1.0
-    } else if seconds < lo {
-        (seconds / lo).clamp(0.25, 1.0)
-    } else {
-        (hi / seconds).clamp(0.25, 1.0)
-    }
-}
-
 fn pick_role(
-    scores: &[[f32; 3]; MAX_SLICES],
+    scores: &[RoleScores; MAX_SLICES],
     count: usize,
-    role: usize,
+    role: Role,
     used: &mut [bool; MAX_SLICES],
     seed: u32,
     salt: u32,
 ) -> usize {
-    let pick = pick_top(count, used, seed, salt, |index| scores[index][role]);
+    let pick = pick_top(count, used, seed, salt, |index| scores[index].of(role));
     if count > 1 {
         used[pick] = true;
     }
@@ -357,15 +318,13 @@ fn pick_role(
 }
 
 fn pick_role_max(
-    scores: &[[f32; 3]; MAX_SLICES],
+    scores: &[RoleScores; MAX_SLICES],
     count: usize,
     used: &mut [bool; MAX_SLICES],
     seed: u32,
     salt: u32,
 ) -> usize {
-    let pick = pick_top(count, used, seed, salt, |index| {
-        scores[index][0].max(scores[index][1]).max(scores[index][2])
-    });
+    let pick = pick_top(count, used, seed, salt, |index| scores[index].best());
     if count > 1 {
         used[pick] = true;
     }
@@ -418,7 +377,7 @@ fn pick_top(
         }
         candidates[n] = index;
         n += 1;
-        if n == 4 {
+        if n == candidates.len() {
             break;
         }
     }
@@ -450,9 +409,9 @@ fn spread_by_index(count: usize, seed: u32) -> [usize; LANES] {
     chosen
 }
 
-fn lane_pitch(seed: u32, lane: usize, global: f32, sound_var: f32) -> f32 {
-    let spread = (hash01(seed, 1000, lane as u32) - 0.5) * 14.0 * sound_var;
-    let hat_lift = if lane == LANE_HIGH {
+fn lane_pitch(seed: u32, lane: Lane, global: f32, sound_var: f32) -> f32 {
+    let spread = (hash01(seed, 1000, lane.index() as u32) - 0.5) * 14.0 * sound_var;
+    let hat_lift = if lane == Lane::High {
         sound_var * 4.0
     } else {
         0.0
@@ -460,33 +419,33 @@ fn lane_pitch(seed: u32, lane: usize, global: f32, sound_var: f32) -> f32 {
     (global + spread + hat_lift).clamp(-24.0, 24.0)
 }
 
-fn lane_decay(seed: u32, lane: usize, global: f32, sound_var: f32) -> f32 {
-    let spread = (hash01(seed, 1100, lane as u32) - 0.5) * sound_var;
+fn lane_decay(seed: u32, lane: Lane, global: f32, sound_var: f32) -> f32 {
+    let spread = (hash01(seed, 1100, lane.index() as u32) - 0.5) * sound_var;
     let role = match lane {
-        LANE_HIGH => 0.72,
-        LANE_LOW => 1.05,
-        _ => 0.9,
+        Lane::High => 0.72,
+        Lane::Low => 1.05,
+        Lane::Mid | Lane::Extra => 0.9,
     };
     (global * role + spread).clamp(0.05, 1.0)
 }
 
-fn lane_tone(seed: u32, lane: usize, global: f32, sound_var: f32) -> f32 {
-    let spread = (hash01(seed, 1200, lane as u32) - 0.5) * sound_var * 0.7;
+fn lane_tone(seed: u32, lane: Lane, global: f32, sound_var: f32) -> f32 {
+    let spread = (hash01(seed, 1200, lane.index() as u32) - 0.5) * sound_var * 0.7;
     let role = match lane {
-        LANE_LOW => -0.12,
-        LANE_HIGH => 0.18,
-        _ => 0.0,
+        Lane::Low => -0.12,
+        Lane::High => 0.18,
+        Lane::Mid | Lane::Extra => 0.0,
     };
     (global + role * sound_var + spread).clamp(0.0, 1.0)
 }
 
-fn lane_pan(seed: u32, lane: usize, sound_var: f32) -> f32 {
+fn lane_pan(seed: u32, lane: Lane, sound_var: f32) -> f32 {
     let sign = match lane {
-        LANE_HIGH => 1.0,
-        LANE_EXTRA => -1.0,
-        _ => 0.0,
+        Lane::High => 1.0,
+        Lane::Extra => -1.0,
+        Lane::Low | Lane::Mid => 0.0,
     };
-    let wobble = (hash01(seed, 1300, lane as u32) - 0.5) * 0.35;
+    let wobble = (hash01(seed, 1300, lane.index() as u32) - 0.5) * 0.35;
     (sign * (0.15 + wobble) * sound_var).clamp(-0.8, 0.8)
 }
 
@@ -519,6 +478,7 @@ fn active_hits(pattern: &Pattern) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::score::{LANE_EXTRA, LANE_HIGH, LANE_LOW, LANE_MID};
 
     fn dummy_slices(count: usize) -> Vec<SliceInfo> {
         (0..count)
@@ -527,8 +487,6 @@ mod tests {
                 SliceInfo {
                     start: index * 1000,
                     end: index * 1000 + 800 + index * 10,
-                    peak: 0.8,
-                    rms: 0.2,
                     brightness,
                     punch: 3.0,
                     norm_gain: 1.0,
@@ -552,8 +510,6 @@ mod tests {
         SliceInfo {
             start: index * 2000,
             end: index * 2000 + 1000,
-            peak: 0.8,
-            rms: 0.2,
             brightness,
             punch: 4.0,
             norm_gain: 1.0,
@@ -741,9 +697,6 @@ mod tests {
                 }
             }
         }
-        assert!(
-            pushed > straight,
-            "pushed {pushed} straight {straight}"
-        );
+        assert!(pushed > straight, "pushed {pushed} straight {straight}");
     }
 }

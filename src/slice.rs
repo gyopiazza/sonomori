@@ -3,10 +3,14 @@
 //! The file is scanned once. Each sensitivity bucket reuses that flux curve and
 //! only changes the peak threshold, the minimum gap, and the longest slice.
 
+use crate::features::MAX_SLICES;
+use crate::score::MIN_SLICE_SAMPLES;
+
 /// Number of precomputed sensitivity settings, from fewest slices to most.
 pub const SENSITIVITY_BUCKETS: usize = 17;
-/// Hard cap so the pattern generator and the UI stay bounded.
-pub const MAX_SLICES: usize = 48;
+const FALLBACK_SLICES: usize = 8;
+
+const _: () = assert!(SENSITIVITY_BUCKETS > 1);
 
 /// Half-wave flux of the short-time RMS envelope.
 pub struct OnsetAnalysis {
@@ -31,9 +35,6 @@ pub fn sensitivity_bucket(sensitivity: f32) -> usize {
 
 /// Sensitivity represented by `bucket` (0 = sparsest, last = busiest).
 pub fn bucket_sensitivity(bucket: usize) -> f32 {
-    if SENSITIVITY_BUCKETS <= 1 {
-        return 0.5;
-    }
     bucket.clamp(0, SENSITIVITY_BUCKETS - 1) as f32 / (SENSITIVITY_BUCKETS - 1) as f32
 }
 
@@ -74,22 +75,18 @@ pub fn slices_for_sensitivity(
     sample_rate: f32,
     sensitivity: f32,
 ) -> Vec<(usize, usize)> {
-    if frame_count < 8 {
+    if frame_count < FALLBACK_SLICES {
         return Vec::new();
     }
 
-    let mut spans = if analysis.flux.len() < 4 || analysis.hop == 0 {
-        even_slices(frame_count, 8)
-    } else {
-        onset_spans(analysis, frame_count, sample_rate, sensitivity)
-    };
+    let mut spans = onset_spans(analysis, frame_count, sample_rate, sensitivity);
     // Life throws away the silence around a hit. A quiet tail would otherwise
     // dilute the band energies that decide which lane a slice belongs to.
     // Splitting a long gap can also leave spans that contain no hit at all.
     trim_silence(&mut spans, analysis, sample_rate, frame_count);
     drop_silent(&mut spans, analysis);
     if spans.is_empty() {
-        even_slices(frame_count, 8)
+        even_slices(frame_count, FALLBACK_SLICES)
     } else {
         spans
     }
@@ -151,7 +148,7 @@ fn onset_spans(
     }
 
     if onsets.len() < 2 {
-        return even_slices(frame_count, 8);
+        return even_slices(frame_count, FALLBACK_SLICES);
     }
 
     let mut spans = Vec::with_capacity(onsets.len());
@@ -169,12 +166,7 @@ fn onset_spans(
     subdivide_long(&mut spans, max_len.max(hop * 2), frame_count);
     merge_until(&mut spans, MAX_SLICES);
     drop_tiny(&mut spans, (0.03 * sample_rate) as usize, frame_count);
-
-    if spans.is_empty() {
-        even_slices(frame_count, 8)
-    } else {
-        spans
-    }
+    spans
 }
 
 /// Pull each span in to the hops that actually contain energy.
@@ -188,7 +180,7 @@ fn trim_silence(
     frame_count: usize,
 ) {
     let hop = analysis.hop;
-    if hop == 0 || analysis.energy.is_empty() || sample_rate <= 0.0 {
+    if analysis.energy.is_empty() || sample_rate <= 0.0 {
         return;
     }
     let min_len = ((0.025 * sample_rate) as usize).max(hop);
@@ -201,11 +193,9 @@ fn trim_silence(
         if end.saturating_sub(start) <= min_len {
             continue;
         }
-        let first = (start / hop).min(hops - 1);
-        let last = ((end - 1) / hop).min(hops - 1);
-        if last < first {
+        let Some((first, last)) = covered_hops(start, end, hop, hops) else {
             continue;
-        }
+        };
 
         let mut peak = 0.0f32;
         for value in &analysis.energy[first..=last] {
@@ -240,7 +230,7 @@ fn trim_silence(
                 new_end = end;
             }
         }
-        if new_end > new_start + 1 {
+        if new_end.saturating_sub(new_start) >= MIN_SLICE_SAMPLES {
             *span = (new_start, new_end);
         }
     }
@@ -248,23 +238,27 @@ fn trim_silence(
 
 fn drop_silent(spans: &mut Vec<(usize, usize)>, analysis: &OnsetAnalysis) {
     let hop = analysis.hop;
-    if hop == 0 || analysis.energy.is_empty() {
+    if analysis.energy.is_empty() {
         return;
     }
     let hops = analysis.energy.len();
     spans.retain(|&(start, end)| {
-        if end <= start {
+        let Some((first, last)) = covered_hops(start, end, hop, hops) else {
             return false;
-        }
-        let first = (start / hop).min(hops - 1);
-        let last = ((end - 1) / hop).min(hops - 1);
-        if last < first {
-            return false;
-        }
+        };
         analysis.energy[first..=last]
             .iter()
             .any(|value| *value >= 1.0e-4)
     });
+}
+
+fn covered_hops(start: usize, end: usize, hop: usize, hops: usize) -> Option<(usize, usize)> {
+    if end <= start || hops == 0 {
+        return None;
+    }
+    let first = (start / hop).min(hops - 1);
+    let last = ((end - 1) / hop).min(hops - 1);
+    (last >= first).then_some((first, last))
 }
 
 fn even_slices(frame_count: usize, count: usize) -> Vec<(usize, usize)> {
@@ -385,7 +379,9 @@ mod tests {
         for time in [20.0, 280.0, 540.0, 860.0] {
             let sample = (time / 1000.0 * sample_rate) as usize;
             assert!(
-                slices.iter().any(|(start, end)| sample >= *start && sample < *end),
+                slices
+                    .iter()
+                    .any(|(start, end)| sample >= *start && sample < *end),
                 "click at {time} ms is not inside a slice: {slices:?}"
             );
         }
