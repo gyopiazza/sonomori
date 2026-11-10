@@ -28,3 +28,9 @@ cargo run --release
 ```
 
 Copy the plugin bundles into your host's plugin folder. On macOS that is `~/Library/Audio/Plug-Ins/CLAP` and `~/Library/Audio/Plug-Ins/VST3`.
+
+## Licenses
+
+Sonomori is MIT. Third-party attribution, including the VST 3 interface, the MPL libraries, and the embedded fonts, is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Ship that file with the plugin bundles and the standalone app.
+
+VST is a registered trademark of Steinberg Media Technologies GmbH.
