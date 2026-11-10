@@ -87,8 +87,7 @@ pub fn beats_from_samples(samples: f64, bpm: f64, sample_rate: f64) -> f64 {
     samples / sample_rate * bpm / 60.0
 }
 
-/// Beat position for one process block. `start` is the position of the first
-/// frame. `disarm` is set when host transport or audition has just begun.
+/// Beat position for one process block. `start` is the position of the first frame.
 pub struct BeatBlock {
     pub start: f64,
     pub disarm: bool,
@@ -97,8 +96,6 @@ pub struct BeatBlock {
     has_position: bool,
 }
 
-/// Remembers the free-running clocks and whether the previous block was playing,
-/// so a start can be told apart from a continuation.
 #[derive(Clone, Copy)]
 pub struct BeatCursor {
     audition_beats: f64,

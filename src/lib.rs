@@ -7,6 +7,7 @@ mod sample;
 mod score;
 mod session;
 mod slice;
+pub mod ui;
 
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -14,9 +15,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use nice_plug::prelude::*;
-use nice_plug_egui::{
-    EguiEditor, EguiEditorState, EguiNiceSettings, RepaintNotifier, create_egui_editor,
-};
 
 use editor::SonomoriEditor;
 use engine::{Audio, Engine, FrameInput, Preview, step_at};
@@ -40,8 +38,8 @@ const RESIZE_HINT: ResizeHint = ResizeHint::resizable()
 pub struct Sonomori {
     params: Arc<SonomoriParams>,
     shared: Shared,
-    editor_state: Arc<EguiEditorState>,
-    repaint_notifier: RepaintNotifier,
+    editor_state: Arc<ui::EditorState>,
+    repaint_notifier: ui::Repaint,
     initial_editor: Option<SonomoriEditor>,
     preview_rx: rtrb::Consumer<u32>,
     snapshot_tx: triple_buffer::Input<Snapshot>,
@@ -66,8 +64,8 @@ impl Default for Sonomori {
         Self {
             params,
             shared,
-            editor_state: EguiEditorState::from_size(WINDOW_SIZE, 1.0),
-            repaint_notifier: RepaintNotifier::new(),
+            editor_state: ui::new_state(WINDOW_SIZE),
+            repaint_notifier: ui::new_repaint(),
             initial_editor: Some(editor),
             preview_rx,
             snapshot_tx,
@@ -130,7 +128,7 @@ impl Plugin for Sonomori {
 
     const SAMPLE_ACCURATE_AUTOMATION: bool = true;
 
-    type Editor = EguiEditor<SonomoriEditor>;
+    type Editor = ui::PluginEditor;
     type SysExMessage = ();
     type BackgroundTask = ();
 
@@ -140,12 +138,11 @@ impl Plugin for Sonomori {
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Self::Editor> {
         let editor = self.initial_editor.take()?;
-        create_egui_editor(
+        ui::open(
             self.editor_state.clone(),
             self.repaint_notifier.clone(),
-            EguiNiceSettings::new()
-                .with_tile(Self::NAME)
-                .with_resize_hint(RESIZE_HINT),
+            Self::NAME,
+            RESIZE_HINT,
             editor,
         )
     }
@@ -295,11 +292,11 @@ impl Plugin for Sonomori {
             clock,
         });
 
-        if self.editor_state.is_open() && (playing || next_meter > METER_ACTIVE) {
+        if ui::is_open(&self.editor_state) && (playing || next_meter > METER_ACTIVE) {
             self.repaint_accum += frames;
             if self.repaint_accum >= self.repaint_interval {
                 self.repaint_accum = 0;
-                self.repaint_notifier.request_repaint();
+                ui::request_repaint(&self.repaint_notifier);
             }
         }
 

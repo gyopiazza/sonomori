@@ -10,7 +10,6 @@ pub const SWING_MAX: f32 = 0.75;
 pub const BARS_MIN: usize = 1;
 pub const BARS_MAX: usize = 2;
 
-/// Quarter notes in a bar, and sixteenth notes in a quarter note.
 pub const BEATS_PER_BAR: usize = 4;
 pub const STEPS_PER_BEAT: usize = 4;
 pub const STEPS_PER_BAR: usize = BEATS_PER_BAR * STEPS_PER_BEAT;

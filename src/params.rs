@@ -9,7 +9,6 @@ use parking_lot::Mutex;
 use crate::pattern::GenParams;
 use crate::score::{BARS_MAX, BARS_MIN, SWING_MAX, SWING_MIN};
 
-/// Inclusive seed the host parameter and the Randomize button both use.
 pub const SEED_MIN: i32 = 1;
 pub const SEED_MAX: i32 = 999_999;
 
@@ -146,7 +145,6 @@ fn ratio_param(name: &'static str, default: f32, min: f32, max: f32) -> FloatPar
 
 const RATIO_STEP: f32 = 0.01;
 
-/// `signed` treats a magnitude above 1.5 as a percent, so a negative entry still scales.
 fn parse_ratio(text: &str, signed: bool) -> Option<f32> {
     let trimmed = text.trim().trim_end_matches('%').trim();
     let value = trimmed.parse::<f32>().ok()?;

@@ -1,14 +1,10 @@
-//! Basic controls: import, waveform, pattern, and the loop macros.
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use nice_plug::context::gui::GuiContext;
 use nice_plug::prelude::*;
-use nice_plug_egui::{NiceEguiApp, widgets};
 
 use crate::features::SliceInfo;
 use crate::params::{SEED_MAX, SEED_MIN, SonomoriParams};
@@ -16,13 +12,14 @@ use crate::sample::{self, IMPORT_EXTENSIONS, SampleData};
 use crate::score::{Lane, Pattern};
 use crate::session::{LoadStatus, METER_ACTIVE, Shared, Snapshot};
 use crate::slice::sensitivity_bucket;
+use crate::ui::{Breadth, Color, Painter, Point, Rect, Sense, Surface};
 
-fn lane_color(lane: Lane) -> Color32 {
+fn lane_color(lane: Lane) -> Color {
     match lane {
-        Lane::Low => Color32::from_rgb(232, 168, 74),
-        Lane::Mid => Color32::from_rgb(224, 92, 78),
-        Lane::High => Color32::from_rgb(86, 196, 184),
-        Lane::Extra => Color32::from_rgb(164, 124, 214),
+        Lane::Low => Color::rgb(232, 168, 74),
+        Lane::Mid => Color::rgb(224, 92, 78),
+        Lane::High => Color::rgb(86, 196, 184),
+        Lane::Extra => Color::rgb(164, 124, 214),
     }
 }
 
@@ -85,6 +82,18 @@ impl SonomoriEditor {
         }
     }
 
+    pub(crate) fn attach_gui(&mut self, gui: GuiContext) {
+        self.gui = Some(gui);
+    }
+
+    pub(crate) fn detach_gui(&mut self) {
+        self.gui = None;
+    }
+
+    pub(crate) fn gui(&self) -> Option<GuiContext> {
+        self.gui.clone()
+    }
+
     fn poll_loads(&mut self) {
         while let Ok(finished) = self.load_rx.try_recv() {
             if finished.id != self.active_load_id {
@@ -127,28 +136,8 @@ impl SonomoriEditor {
             }
         }
     }
-}
 
-impl NiceEguiApp for SonomoriEditor {
-    fn build(
-        &mut self,
-        egui_ctx: egui::Context,
-        nice_gui_ctx: GuiContext,
-        _frame: &mut nice_plug_egui::Frame,
-    ) -> Result<(), nice_plug_egui::baseview::HandlerError> {
-        egui_ctx.set_theme(egui::Theme::Dark);
-        egui_ctx.style_mut_of(egui::Theme::Dark, |style| {
-            style.spacing.item_spacing = Vec2::new(8.0, 6.0);
-        });
-        self.gui = Some(nice_gui_ctx);
-        Ok(())
-    }
-
-    fn editor_closed(&mut self) {
-        self.gui = None;
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut nice_plug_egui::Frame) {
+    pub(crate) fn show(&mut self, ui: &mut impl Surface, setter: &ParamSetter<'_>) {
         self.poll_loads();
         self.poll_import();
         let sample = self.shared.sample.load_full();
@@ -157,7 +146,7 @@ impl NiceEguiApp for SonomoriEditor {
         let mut request_import = false;
         draw(
             ui,
-            &self.gui,
+            setter,
             &self.params,
             &self.shared,
             &mut self.preview_tx,
@@ -174,7 +163,7 @@ impl NiceEguiApp for SonomoriEditor {
         }
         if request_import {
             self.import_open = true;
-            ui.ctx().request_repaint();
+            ui.request_repaint();
             open_import_dialog(self.import_tx.clone());
             // Outside macOS the panel runs before this returns. On macOS it is
             // queued, and a later frame reads the chosen path.
@@ -203,8 +192,8 @@ fn open_import_dialog(tx: Sender<Option<PathBuf>>) {
 }
 
 fn draw(
-    ui: &mut egui::Ui,
-    gui: &Option<GuiContext>,
+    ui: &mut impl Surface,
+    setter: &ParamSetter<'_>,
     params: &SonomoriParams,
     shared: &Shared,
     preview_tx: &mut rtrb::Producer<u32>,
@@ -216,10 +205,6 @@ fn draw(
     import_open: bool,
     request_import: &mut bool,
 ) {
-    let Some(gui) = gui.as_ref() else {
-        return;
-    };
-    let setter = gui.param_setter();
     let bucket = sensitivity_bucket(params.sensitivity.value());
     let slices = sample
         .as_ref()
@@ -229,30 +214,24 @@ fn draw(
 
     ui.heading(crate::Sonomori::NAME);
     ui.label("Import a sound, chop it on transients, and play a generated loop.");
-    ui.add_space(4.0);
+    ui.space(4.0);
 
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(!import_open, egui::Button::new("Import"))
-            .clicked()
-        {
+    ui.row(|ui| {
+        if ui.button("Import", !import_open) {
             *request_import = true;
         }
-        if ui.button("Randomize").clicked() {
-            randomize(&setter, params, undo_seed);
+        if ui.button("Randomize", true) {
+            randomize(setter, params, undo_seed);
         }
-        let undo_enabled = undo_seed.is_some();
-        if ui
-            .add_enabled(undo_enabled, egui::Button::new("Undo"))
-            .clicked()
+        if ui.button("Undo", undo_seed.is_some())
             && let Some(seed) = undo_seed.take()
         {
-            set_int(&setter, &params.seed, seed);
+            set_int(setter, &params.seed, seed);
         }
-        ui.label(format!("Seed {}", params.seed.value()));
+        ui.label(&format!("Seed {}", params.seed.value()));
     });
 
-    ui.horizontal(|ui| {
+    ui.row(|ui| {
         let standalone = shared.standalone.load(Ordering::Relaxed);
         let audition = shared.audition.load(Ordering::Relaxed);
         let label = if audition {
@@ -262,13 +241,13 @@ fn draw(
         } else {
             "Audition"
         };
-        if ui.button(label).clicked() {
+        if ui.button(label, true) {
             shared.audition.store(!audition, Ordering::Relaxed);
         }
         if snapshot.clock.host_playing {
-            ui.label(format!("Host is playing at {:.1} BPM", snapshot.clock.bpm));
+            ui.label(&format!("Host is playing at {:.1} BPM", snapshot.clock.bpm));
         } else if audition {
-            ui.label(format!(
+            ui.label(&format!(
                 "{} at {:.1} BPM",
                 if standalone { "Playing" } else { "Audition" },
                 snapshot.clock.bpm
@@ -280,13 +259,9 @@ fn draw(
         }
     });
 
-    ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(path_input)
-                .desired_width(360.0)
-                .hint_text("or paste a file path"),
-        );
-        if ui.button("Load path").clicked() {
+    ui.row(|ui| {
+        ui.text_field(path_input, "or paste a file path", 360.0);
+        if ui.button("Load path", true) {
             let path = PathBuf::from(path_input.trim());
             if !path.as_os_str().is_empty() {
                 *queued_load = Some(path);
@@ -294,67 +269,50 @@ fn draw(
         }
     });
 
-    ui.label(status_line(shared, sample.as_deref(), slices.len()));
+    ui.label(&status_line(shared, sample.as_deref(), slices.len()));
 
     if let Some(loaded) = sample.as_ref() {
         paint_waveform(ui, loaded, slices, snapshot, preview_tx);
     } else {
-        let (rect, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 110.0), Sense::hover());
-        ui.painter()
-            .rect_filled(rect, 4.0, Color32::from_rgb(22, 24, 28));
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "No sound loaded",
-            egui::FontId::proportional(14.0),
-            Color32::from_rgb(140, 144, 150),
-        );
+        ui.canvas(Breadth::Fill, 110.0, Sense::Hover, |rect, painter, _| {
+            painter.fill(rect, 4.0, Color::rgb(22, 24, 28));
+            painter.text_centered(
+                rect.center(),
+                "No sound loaded",
+                14.0,
+                Color::rgb(140, 144, 150),
+            );
+        });
     }
 
-    ui.add_space(6.0);
+    ui.space(6.0);
     ui.label("Pattern");
     paint_pattern(ui, snapshot);
 
-    ui.add_space(8.0);
-    ui.columns(2, |columns| {
-        add_slider(&mut columns[0], "Density", &params.density, &setter);
-        add_slider(&mut columns[0], "Syncopation", &params.syncopation, &setter);
-        add_slider(&mut columns[0], "Symmetry", &params.symmetry, &setter);
-        add_slider(
-            &mut columns[0],
-            "Pattern variation",
-            &params.pattern_var,
-            &setter,
-        );
-        add_slider(&mut columns[0], "Swing", &params.swing, &setter);
-        add_slider(&mut columns[0], "Bars", &params.bars, &setter);
+    ui.space(8.0);
+    ui.split_two(|left, right| {
+        left.param_slider("Density", &params.density, setter);
+        left.param_slider("Syncopation", &params.syncopation, setter);
+        left.param_slider("Symmetry", &params.symmetry, setter);
+        left.param_slider("Pattern variation", &params.pattern_var, setter);
+        left.param_slider("Swing", &params.swing, setter);
+        left.param_slider("Bars", &params.bars, setter);
 
-        add_slider(
-            &mut columns[1],
-            "Sound variation",
-            &params.sound_var,
-            &setter,
-        );
-        add_slider(&mut columns[1], "Decay", &params.decay, &setter);
-        add_slider(&mut columns[1], "Pitch", &params.pitch, &setter);
-        add_slider(&mut columns[1], "Tone", &params.tone, &setter);
-        add_slider(
-            &mut columns[1],
-            "Slice sensitivity",
-            &params.sensitivity,
-            &setter,
-        );
+        right.param_slider("Sound variation", &params.sound_var, setter);
+        right.param_slider("Decay", &params.decay, setter);
+        right.param_slider("Pitch", &params.pitch, setter);
+        right.param_slider("Tone", &params.tone, setter);
+        right.param_slider("Slice sensitivity", &params.sensitivity, setter);
         let tempo_label = if shared.standalone.load(Ordering::Relaxed) {
             "Tempo"
         } else {
             "Audition tempo"
         };
-        add_slider(&mut columns[1], tempo_label, &params.tempo, &setter);
-        add_slider(&mut columns[1], "Output", &params.output, &setter);
+        right.param_slider(tempo_label, &params.tempo, setter);
+        right.param_slider("Output", &params.output, setter);
     });
 
-    ui.add_space(6.0);
+    ui.space(6.0);
     let meter = shared.meter.load(Ordering::Relaxed);
     let db = if meter > 1.0e-8 {
         20.0 * meter.log10()
@@ -362,13 +320,10 @@ fn draw(
         -80.0
     };
     let normalized = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
-    ui.add(egui::ProgressBar::new(normalized).text(format!("{db:.1} dB")));
-    ui.label(
-        egui::RichText::new(
-            "Click a slice to preview it. Randomize picks new slices and a new groove. The macros reshape that groove.",
-        )
-        .weak()
-        .size(12.0),
+    ui.progress(normalized, &format!("{db:.1} dB"));
+    ui.hint(
+        "Click a slice to preview it. Randomize picks new slices and a new groove. The macros reshape that groove.",
+        12.0,
     );
 
     if snapshot.playing
@@ -376,13 +331,8 @@ fn draw(
         || import_open
         || matches!(*shared.status.lock(), LoadStatus::Loading { .. })
     {
-        ui.ctx().request_repaint();
+        ui.request_repaint();
     }
-}
-
-fn add_slider<P: Param>(ui: &mut egui::Ui, label: &str, param: &P, setter: &ParamSetter<'_>) {
-    ui.label(label);
-    ui.add(widgets::ParamSlider::for_param(param, setter).with_width(ui.available_width()));
 }
 
 fn randomize(setter: &ParamSetter<'_>, params: &SonomoriParams, undo_seed: &mut Option<i32>) {
@@ -429,60 +379,92 @@ fn status_line(shared: &Shared, sample: Option<&SampleData>, slice_count: usize)
 }
 
 fn paint_waveform(
-    ui: &mut egui::Ui,
+    ui: &mut impl Surface,
     sample: &SampleData,
     slices: &[SliceInfo],
     snapshot: &Snapshot,
     preview_tx: &mut rtrb::Producer<u32>,
 ) {
-    let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 128.0), Sense::click());
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 4.0, Color32::from_rgb(22, 24, 28));
-    if sample.len() == 0 || rect.width() < 2.0 {
-        return;
-    }
+    ui.canvas(
+        Breadth::Fill,
+        128.0,
+        Sense::Click,
+        |rect, painter, click| {
+            painter.fill(rect, 4.0, Color::rgb(22, 24, 28));
+            if sample.len() > 0 && rect.width() >= 2.0 {
+                paint_waveform_contents(painter, rect, sample, slices, snapshot, click, preview_tx);
+            }
+        },
+    );
+}
 
+fn paint_waveform_contents(
+    painter: &mut impl Painter,
+    rect: Rect,
+    sample: &SampleData,
+    slices: &[SliceInfo],
+    snapshot: &Snapshot,
+    click: Option<Point>,
+    preview_tx: &mut rtrb::Producer<u32>,
+) {
+    let frames = sample.len() as f32;
     for lane in Lane::ALL {
         let played = &snapshot.pattern.lanes[lane.index()];
         if played.end <= played.start {
             continue;
         }
-        let start_x = rect.left() + rect.width() * played.start as f32 / sample.len() as f32;
-        let end_x = rect.left() + rect.width() * played.end as f32 / sample.len() as f32;
+        let start_x = rect.left() + rect.width() * played.start as f32 / frames;
+        let end_x = rect.left() + rect.width() * played.end as f32 / frames;
         let region = Rect::from_min_max(
-            Pos2::new(start_x, rect.top()),
-            Pos2::new(end_x.max(start_x + 1.0), rect.bottom()),
+            Point {
+                x: start_x,
+                y: rect.top(),
+            },
+            Point {
+                x: end_x.max(start_x + 1.0),
+                y: rect.bottom(),
+            },
         );
-        painter.rect_filled(region, 0.0, lane_color(lane).gamma_multiply(0.28));
+        painter.fill(region, 0.0, lane_color(lane).fade(0.28));
     }
 
     let mid_y = rect.center().y;
     let scale = rect.height() * 0.46 / sample.display_peak;
     let columns = sample.peaks.len().max(1);
+    let stroke = Color::rgb(210, 214, 220);
     for (index, peak) in sample.peaks.iter().enumerate() {
         let x = rect.left() + rect.width() * index as f32 / columns as f32;
-        let y0 = mid_y - peak.max * scale;
-        let y1 = mid_y - peak.min * scale;
-        painter.line_segment(
-            [Pos2::new(x, y0), Pos2::new(x, y1)],
-            Stroke::new(1.0, Color32::from_rgb(210, 214, 220)),
+        painter.line(
+            Point {
+                x,
+                y: mid_y - peak.max * scale,
+            },
+            Point {
+                x,
+                y: mid_y - peak.min * scale,
+            },
+            1.0,
+            stroke,
         );
     }
 
+    let mark = Color::rgba(255, 255, 255, 40);
     for slice in slices {
-        let x = rect.left() + rect.width() * slice.start as f32 / sample.len() as f32;
-        painter.line_segment(
-            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)),
+        let x = rect.left() + rect.width() * slice.start as f32 / frames;
+        painter.line(
+            Point { x, y: rect.top() },
+            Point {
+                x,
+                y: rect.bottom(),
+            },
+            1.0,
+            mark,
         );
     }
 
-    if response.clicked()
-        && let Some(pointer) = response.interact_pointer_pos()
-    {
+    if let Some(pointer) = click {
         let position = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 0.999);
-        let frame = (position * sample.len() as f32) as usize;
+        let frame = (position * frames) as usize;
         if let Some(index) = slices
             .iter()
             .position(|slice| frame >= slice.start && frame < slice.end)
@@ -492,39 +474,45 @@ fn paint_waveform(
     }
 }
 
-fn paint_pattern(ui: &mut egui::Ui, snapshot: &Snapshot) {
+fn paint_pattern(ui: &mut impl Surface, snapshot: &Snapshot) {
     let pattern: &Pattern = &snapshot.pattern;
     let steps = pattern.steps.max(1);
     for lane in Lane::ALL {
-        ui.horizontal(|ui| {
-            let (swatch, _) = ui.allocate_exact_size(Vec2::new(10.0, 10.0), Sense::hover());
-            ui.painter().rect_filled(swatch, 2.0, lane_color(lane));
+        ui.row(|ui| {
+            let color = lane_color(lane);
+            ui.canvas(
+                Breadth::Fixed(10.0),
+                10.0,
+                Sense::Hover,
+                |swatch, painter, _| {
+                    painter.fill(swatch, 2.0, color);
+                },
+            );
             ui.label(lane_name(lane));
         });
-        let width = ui.available_width();
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 18.0), Sense::hover());
-        let cell = rect.width() / steps as f32;
-        let painter = ui.painter();
-        for step in 0..steps {
-            let x = rect.left() + cell * step as f32;
-            let cell_rect = Rect::from_min_size(
-                Pos2::new(x + 1.0, rect.top()),
-                Vec2::new((cell - 2.0).max(1.0), rect.height()),
-            );
-            let velocity = pattern.lanes[lane.index()].velocity[step];
-            let color = if velocity > 0.0 {
-                lane_color(lane).gamma_multiply(0.35 + 0.65 * velocity)
-            } else {
-                Color32::from_rgb(38, 40, 46)
-            };
-            painter.rect_filled(cell_rect, 2.0, color);
-            if snapshot.playhead == Some(step) {
-                painter.rect_filled(
-                    cell_rect.shrink(1.0),
-                    1.0,
-                    Color32::from_rgba_unmultiplied(255, 255, 255, 70),
+        ui.canvas(Breadth::Fill, 18.0, Sense::Hover, |rect, painter, _| {
+            let cell = rect.width() / steps as f32;
+            for step in 0..steps {
+                let x = rect.left() + cell * step as f32;
+                let cell_rect = Rect::from_min_size(
+                    Point {
+                        x: x + 1.0,
+                        y: rect.top(),
+                    },
+                    (cell - 2.0).max(1.0),
+                    rect.height(),
                 );
+                let velocity = pattern.lanes[lane.index()].velocity[step];
+                let color = if velocity > 0.0 {
+                    lane_color(lane).fade(0.35 + 0.65 * velocity)
+                } else {
+                    Color::rgb(38, 40, 46)
+                };
+                painter.fill(cell_rect, 2.0, color);
+                if snapshot.playhead == Some(step) {
+                    painter.fill(cell_rect.shrink(1.0), 1.0, Color::rgba(255, 255, 255, 70));
+                }
             }
-        }
+        });
     }
 }

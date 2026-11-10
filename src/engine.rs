@@ -1,9 +1,3 @@
-//! Sample-accurate loop player.
-//!
-//! Four monophonic lanes plus one preview voice. Timing follows the host
-//! timeline when it is playing, in sixteenth notes, with a swing ratio that
-//! delays every other sixteenth.
-
 use crate::score::{
     LANES, Lane, MAX_STEPS, MIN_SLICE_SAMPLES, Pattern, STEPS_PER_BEAT, SWING_MAX, SWING_MIN,
 };
@@ -125,7 +119,6 @@ impl Engine {
         self.dc_r = DcBlock::default();
     }
 
-    /// Forget the last triggered step so the next playing sample fires again.
     pub fn disarm_step(&mut self) {
         self.last_step = None;
     }
@@ -320,8 +313,6 @@ impl Voice {
     }
 }
 
-/// Swing is the fraction of each eighth note occupied by the first sixteenth.
-/// 0.5 is straight. Higher values delay the off-sixteenth.
 pub fn step_at(beats: f64, swing: f64, steps: usize) -> usize {
     let steps = steps.max(1);
     let pattern_beats = steps as f64 / STEPS_PER_BEAT as f64;

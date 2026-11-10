@@ -31,9 +31,6 @@ pub struct GenParams {
 }
 
 /// Collapse knob noise so the cache misses only when a macro actually moves.
-///
-/// Fields left untouched by the struct update are compared exactly, so a new
-/// field participates in the key without a second list.
 pub fn cache_key(params: &GenParams) -> GenParams {
     GenParams {
         density: quantize_unit(params.density),
@@ -207,7 +204,6 @@ fn on_backbeat(pos: usize) -> bool {
     pos == STEPS_PER_BEAT || pos == STEPS_PER_BEAT * (BEATS_PER_BAR - 1)
 }
 
-/// Chance that `step` (0..16 inside a bar) fires on `lane`.
 fn step_weight(lane: Lane, step: usize, density: f32, sync: f32) -> f32 {
     let pos = step % STEPS_PER_BAR;
     let sync_pos = (sync + 1.0) * 0.5;
@@ -294,7 +290,6 @@ fn pick_slices(slices: &[SliceInfo], seed: u32) -> [usize; LANES] {
 
     let mut used = [false; MAX_SLICES];
     let mut chosen = [0usize; LANES];
-    // Kick and hat claim a slice before Mid, so the extremes stay in their lanes.
     chosen[Lane::Low.index()] = pick_role(&scores, count, Role::Kick, &mut used, seed, 900);
     chosen[Lane::High.index()] = pick_role(&scores, count, Role::Hat, &mut used, seed, 901);
     chosen[Lane::Mid.index()] = pick_role(&scores, count, Role::Snare, &mut used, seed, 902);

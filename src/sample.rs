@@ -1,5 +1,3 @@
-//! Decode an audio file and precompute slice sets for every sensitivity bucket.
-
 use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};

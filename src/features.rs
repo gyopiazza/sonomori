@@ -49,7 +49,6 @@ pub struct SliceInfo {
     pub end: usize,
     pub brightness: f32,
     pub punch: f32,
-    /// Peak-normalizing gain, capped so quiet noise is not boosted without limit.
     pub norm_gain: f32,
     /// Share of energy below ~180 Hz. Kicks live here.
     pub low_ratio: f32,
@@ -57,7 +56,6 @@ pub struct SliceInfo {
     pub mid_ratio: f32,
     /// Share of energy above ~4.5 kHz. Hats live here.
     pub high_ratio: f32,
-    /// Length of the trimmed slice in seconds.
     pub seconds: f32,
 }
 
@@ -71,7 +69,6 @@ pub fn measure(
     let end = end.min(left.len()).min(right.len());
     let start = start.min(end);
     let rate = sample_rate.max(1.0);
-    // Two one-pole splits, updated in the same pass as peak and zero crossings.
     let low_coef = one_pole_coef(180.0, rate);
     let high_coef = one_pole_coef(4_500.0, rate);
 
@@ -116,7 +113,6 @@ pub fn measure(
     };
     let rms = (sum / span as f64).sqrt() as f32;
     let zcr = crossings as f32 / span as f32;
-    // Zero crossings catch a short bright click; the high band catches a noisy hat.
     let brightness = (0.65 * high_ratio + 0.35 * (zcr / 0.08).clamp(0.0, 1.0)).clamp(0.0, 1.0);
     let punch = if rms > 1.0e-6 { peak / rms } else { 1.0 };
     let norm_gain = if peak < 1.0e-4 {
@@ -142,8 +138,6 @@ fn one_pole_coef(hz: f32, sample_rate: f32) -> f32 {
     1.0 - (-std::f32::consts::TAU * hz / sample_rate).exp()
 }
 
-/// Kick, snare, and hat scores. Absolute, so a file full of hats does not grow
-/// a fake kick out of whichever hat is least bright.
 pub fn role_scores(slice: &SliceInfo) -> RoleScores {
     let low = slice.low_ratio;
     let mid = slice.mid_ratio;
@@ -154,7 +148,6 @@ pub fn role_scores(slice: &SliceInfo) -> RoleScores {
     let tick = length_fit(slice.seconds, 0.012, 0.14);
 
     let kick = low * (0.55 + 0.45 * punch) * (0.4 + 0.6 * body) * (1.0 - high * 0.8);
-    // Mid and high together: a snare has a body and noise. A hat is almost all high.
     let snare = (0.65 * mid + 0.35 * high * mid)
         * (0.5 + 0.5 * punch)
         * (0.45 + 0.55 * snap)
@@ -170,7 +163,6 @@ pub fn role_scores(slice: &SliceInfo) -> RoleScores {
     }
 }
 
-/// 1 inside `[lo, hi]`, falling off outside without ever reaching zero.
 fn length_fit(seconds: f32, lo: f32, hi: f32) -> f32 {
     if seconds >= lo && seconds <= hi {
         1.0

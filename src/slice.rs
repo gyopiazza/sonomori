@@ -12,7 +12,6 @@ const FALLBACK_SLICES: usize = 8;
 
 const _: () = assert!(SENSITIVITY_BUCKETS > 1);
 
-/// Half-wave flux of the short-time RMS envelope.
 pub struct OnsetAnalysis {
     hop: usize,
     flux: Vec<f32>,
@@ -27,7 +26,6 @@ struct Onset {
     score: f32,
 }
 
-/// Map a 0..1 sensitivity knob onto a precomputed bucket.
 pub fn sensitivity_bucket(sensitivity: f32) -> usize {
     let max = (SENSITIVITY_BUCKETS - 1) as f32;
     (sensitivity.clamp(0.0, 1.0) * max).round() as usize
@@ -108,7 +106,6 @@ fn onset_spans(
         prefix[index + 1] = prefix[index] + value;
     }
 
-    // Higher sensitivity lowers the threshold and allows closer cuts.
     let multiplier = 3.4 - sensitivity * 2.6;
     let min_gap_samples = ((0.20 - sensitivity * 0.15).max(0.035) * sample_rate) as usize;
     let min_gap_frames = (min_gap_samples / hop).max(1);
@@ -169,10 +166,6 @@ fn onset_spans(
     spans
 }
 
-/// Pull each span in to the hops that actually contain energy.
-///
-/// The floor is relative to that span's own peak, so a quiet hit is not judged
-/// against a loud one. A short hold keeps the tail after it crosses the floor.
 fn trim_silence(
     spans: &mut [(usize, usize)],
     analysis: &OnsetAnalysis,
@@ -220,7 +213,6 @@ fn trim_silence(
             continue;
         };
 
-        // Stay inside the original span so neighboring slices cannot overlap.
         let mut new_start = (loud_first * hop).max(start);
         let mut new_end = ((loud_last + 1) * hop + hold).min(end);
         if new_end.saturating_sub(new_start) < min_len {
@@ -411,9 +403,6 @@ mod tests {
     #[test]
     fn higher_sensitivity_keeps_more_slices() {
         let sample_rate = 44_100.0;
-        let mut times = vec![30.0, 400.0, 820.0, 1300.0];
-        // Weaker clicks between the strong ones.
-        times.extend([180.0, 620.0, 1080.0]);
         let mut mono = click_train(sample_rate, &[30.0, 400.0, 820.0, 1300.0], 1.0);
         let weak = click_train(sample_rate, &[180.0, 620.0, 1080.0], 0.28);
         for (slot, sample) in mono.iter_mut().zip(weak) {
@@ -423,12 +412,11 @@ mod tests {
         let low = slices_for_sensitivity(&analysis, mono.len(), sample_rate, 0.05);
         let high = slices_for_sensitivity(&analysis, mono.len(), sample_rate, 0.95);
         assert!(
-            high.len() >= low.len(),
-            "high {} should be >= low {}",
+            high.len() > low.len(),
+            "high {} should be > low {}",
             high.len(),
             low.len()
         );
-        assert!(high.len() > low.len());
     }
 
     #[test]
