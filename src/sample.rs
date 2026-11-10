@@ -28,10 +28,17 @@ pub struct SliceInfo {
     #[allow(dead_code)]
     pub rms: f32,
     pub brightness: f32,
-    #[allow(dead_code)]
     pub punch: f32,
     /// Peak-normalizing gain, capped so quiet noise is not boosted without limit.
     pub norm_gain: f32,
+    /// Share of energy below ~180 Hz. Kicks live here.
+    pub low_ratio: f32,
+    /// Share of energy between ~180 Hz and ~4.5 kHz.
+    pub mid_ratio: f32,
+    /// Share of energy above ~4.5 kHz. Hats live here.
+    pub high_ratio: f32,
+    /// Length of the trimmed slice in seconds.
+    pub seconds: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -197,7 +204,7 @@ impl SampleData {
             let spans = slice::slices_for_sensitivity(&analysis, frames, sample_rate, sensitivity);
             let infos = spans
                 .into_iter()
-                .map(|(start, end)| slice_info(&left, &right, start, end))
+                .map(|(start, end)| slice_info(&left, &right, start, end, sample_rate))
                 .filter(|info| info.end > info.start + 1)
                 .collect();
             buckets.push(infos);
@@ -231,26 +238,63 @@ impl SampleData {
     }
 }
 
-fn slice_info(left: &[f32], right: &[f32], start: usize, end: usize) -> SliceInfo {
+fn slice_info(
+    left: &[f32],
+    right: &[f32],
+    start: usize,
+    end: usize,
+    sample_rate: f32,
+) -> SliceInfo {
     let end = end.min(left.len()).min(right.len());
     let start = start.min(end);
+    let rate = sample_rate.max(1.0);
+    // Two one-pole splits, updated in the same pass as peak and zero crossings.
+    let low_coef = one_pole_coef(180.0, rate);
+    let high_coef = one_pole_coef(4_500.0, rate);
+
     let mut peak = 0.0f32;
-    let mut sum = 0.0f32;
+    let mut sum = 0.0f64;
+    let mut low_energy = 0.0f64;
+    let mut mid_energy = 0.0f64;
+    let mut high_energy = 0.0f64;
+    let mut low = 0.0f32;
+    let mut body = 0.0f32;
     let mut crossings = 0usize;
     let mut previous = 0.0f32;
     let span = end.saturating_sub(start).max(1);
+
     for index in start..end {
-        let mid = 0.5 * (left[index] + right[index]);
+        let sample = 0.5 * (left[index] + right[index]);
+        low += low_coef * (sample - low);
+        body += high_coef * (sample - body);
+        let high = sample - body;
+        let mid = body - low;
+        low_energy += f64::from(low) * f64::from(low);
+        mid_energy += f64::from(mid) * f64::from(mid);
+        high_energy += f64::from(high) * f64::from(high);
+
         peak = peak.max(left[index].abs()).max(right[index].abs());
-        sum += mid * mid;
-        if index > start && previous.signum() != mid.signum() && mid.abs() > 1.0e-5 {
+        sum += f64::from(sample) * f64::from(sample);
+        if index > start && previous.signum() != sample.signum() && sample.abs() > 1.0e-5 {
             crossings += 1;
         }
-        previous = mid;
+        previous = sample;
     }
-    let rms = (sum / span as f32).sqrt();
+
+    let total = low_energy + mid_energy + high_energy;
+    let (low_ratio, mid_ratio, high_ratio) = if total > 1.0e-12 {
+        (
+            (low_energy / total) as f32,
+            (mid_energy / total) as f32,
+            (high_energy / total) as f32,
+        )
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+    let rms = (sum / span as f64).sqrt() as f32;
     let zcr = crossings as f32 / span as f32;
-    let brightness = (zcr / 0.12).clamp(0.0, 1.0);
+    // Zero crossings catch a short bright click; the high band catches a noisy hat.
+    let brightness = (0.65 * high_ratio + 0.35 * (zcr / 0.08).clamp(0.0, 1.0)).clamp(0.0, 1.0);
     let punch = if rms > 1.0e-6 { peak / rms } else { 1.0 };
     let norm_gain = if peak < 1.0e-4 {
         1.0
@@ -265,7 +309,16 @@ fn slice_info(left: &[f32], right: &[f32], start: usize, end: usize) -> SliceInf
         brightness,
         punch,
         norm_gain,
+        low_ratio,
+        mid_ratio,
+        high_ratio,
+        seconds: span as f32 / rate,
     }
+}
+
+fn one_pole_coef(hz: f32, sample_rate: f32) -> f32 {
+    let hz = hz.clamp(1.0, sample_rate * 0.45);
+    1.0 - (-std::f32::consts::TAU * hz / sample_rate).exp()
 }
 
 fn waveform_peaks(left: &[f32], right: &[f32]) -> Vec<WaveformPeak> {
@@ -337,5 +390,54 @@ mod tests {
         let slices = &loaded.buckets[slice::sensitivity_bucket(0.6)];
         assert!(slices.len() >= 3, "got {} slices", slices.len());
         assert!(!loaded.trimmed);
+    }
+
+    #[test]
+    fn low_tone_and_noise_land_in_different_bands() {
+        let sample_rate = 44_100.0;
+        let frames = sample_rate as usize;
+        let low: Vec<f32> = (0..frames)
+            .map(|index| (index as f32 * 80.0 * std::f32::consts::TAU / sample_rate).sin() * 0.5)
+            .collect();
+        let low_sample = SampleData::from_channels(
+            low.clone(),
+            low,
+            sample_rate,
+            "low".into(),
+            String::new(),
+            false,
+        );
+        for info in &low_sample.buckets[0] {
+            assert!(
+                info.low_ratio > 0.6 && info.low_ratio > info.high_ratio,
+                "low {} high {}",
+                info.low_ratio,
+                info.high_ratio
+            );
+        }
+
+        let mut state = 0x1234_5678u32;
+        let noise: Vec<f32> = (0..frames)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 16) as f32 / 32_768.0 - 1.0) * 0.3
+            })
+            .collect();
+        let noise_sample = SampleData::from_channels(
+            noise.clone(),
+            noise,
+            sample_rate,
+            "noise".into(),
+            String::new(),
+            false,
+        );
+        for info in &noise_sample.buckets[0] {
+            assert!(
+                info.high_ratio > info.low_ratio,
+                "low {} high {}",
+                info.low_ratio,
+                info.high_ratio
+            );
+        }
     }
 }

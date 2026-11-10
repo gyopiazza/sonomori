@@ -3,6 +3,10 @@
 //! The same seed and macro settings always rebuild the same pattern. Randomize
 //! only changes the seed. Density, syncopation, and symmetry reshape that beat
 //! instead of rolling a new one.
+//!
+//! Lane assignment follows the slice, the way Life groups hits that sound
+//! alike. Low prefers a kick-like hit, Mid a snare-like hit, High a hat-like
+//! hit. The seed only chooses among slices that already fit that lane.
 
 use crate::sample::SliceInfo;
 use crate::slice::MAX_SLICES;
@@ -276,81 +280,174 @@ fn pick_slices(slices: &[SliceInfo], seed: u32) -> [usize; LANES] {
         return [0; LANES];
     }
 
-    let mut by_brightness = [0usize; MAX_SLICES];
+    let mut bassiness_low = f32::MAX;
+    let mut bassiness_high = f32::MIN;
+    let mut scores = [[0.0f32; 3]; MAX_SLICES];
     for index in 0..count {
-        by_brightness[index] = index;
+        let bassiness = slices[index].low_ratio - slices[index].high_ratio;
+        bassiness_low = bassiness_low.min(bassiness);
+        bassiness_high = bassiness_high.max(bassiness);
+        scores[index] = role_scores(&slices[index]);
+    }
+
+    // A shaker or a tone has no kick/snare/hat split. Spread the lanes across
+    // the slices instead of forcing a role onto sounds that all match.
+    if count == 1 || bassiness_high - bassiness_low < 0.08 {
+        return spread_by_index(count, seed);
+    }
+
+    let mut used = [false; MAX_SLICES];
+    let mut chosen = [0usize; LANES];
+    // Kick and hat claim a slice before Mid, so the extremes stay in their lanes.
+    chosen[LANE_LOW] = pick_role(&scores, count, 0, &mut used, seed, 900);
+    chosen[LANE_HIGH] = pick_role(&scores, count, 2, &mut used, seed, 901);
+    chosen[LANE_MID] = pick_role(&scores, count, 1, &mut used, seed, 902);
+    chosen[LANE_EXTRA] = pick_role_max(&scores, count, &mut used, seed, 903);
+    chosen
+}
+
+/// Kick, snare, and hat scores. Absolute, so a file full of hats does not grow
+/// a fake kick out of whichever hat is least bright.
+fn role_scores(slice: &SliceInfo) -> [f32; 3] {
+    let low = slice.low_ratio;
+    let mid = slice.mid_ratio;
+    let high = slice.high_ratio;
+    let punch = (slice.punch / 5.0).clamp(0.2, 1.0);
+    let body = length_fit(slice.seconds, 0.08, 0.85);
+    let snap = length_fit(slice.seconds, 0.04, 0.45);
+    let tick = length_fit(slice.seconds, 0.012, 0.14);
+
+    let kick = low * (0.55 + 0.45 * punch) * (0.4 + 0.6 * body) * (1.0 - high * 0.8);
+    // Mid and high together: a snare has a body and noise. A hat is almost all high.
+    let snare = (0.65 * mid + 0.35 * high * mid)
+        * (0.5 + 0.5 * punch)
+        * (0.45 + 0.55 * snap)
+        * (1.0 - low * 0.65);
+    let hat = (0.6 * high + 0.4 * slice.brightness)
+        * (0.35 + 0.65 * tick)
+        * (1.0 - low * 0.85)
+        * (1.0 - mid * 0.25);
+    [kick.max(0.0), snare.max(0.0), hat.max(0.0)]
+}
+
+/// 1 inside `[lo, hi]`, falling off outside without ever reaching zero.
+fn length_fit(seconds: f32, lo: f32, hi: f32) -> f32 {
+    if seconds >= lo && seconds <= hi {
+        1.0
+    } else if seconds < lo {
+        (seconds / lo).clamp(0.25, 1.0)
+    } else {
+        (hi / seconds).clamp(0.25, 1.0)
+    }
+}
+
+fn pick_role(
+    scores: &[[f32; 3]; MAX_SLICES],
+    count: usize,
+    role: usize,
+    used: &mut [bool; MAX_SLICES],
+    seed: u32,
+    salt: u32,
+) -> usize {
+    let pick = pick_top(count, used, seed, salt, |index| scores[index][role]);
+    if count > 1 {
+        used[pick] = true;
+    }
+    pick
+}
+
+fn pick_role_max(
+    scores: &[[f32; 3]; MAX_SLICES],
+    count: usize,
+    used: &mut [bool; MAX_SLICES],
+    seed: u32,
+    salt: u32,
+) -> usize {
+    let pick = pick_top(count, used, seed, salt, |index| {
+        scores[index][0].max(scores[index][1]).max(scores[index][2])
+    });
+    if count > 1 {
+        used[pick] = true;
+    }
+    pick
+}
+
+/// Seeded pick among the best unused slices for one score.
+///
+/// Candidates have to stay close to the winner, so Randomize can swap two
+/// kicks and cannot put a hat on the low lane.
+fn pick_top(
+    count: usize,
+    used: &[bool; MAX_SLICES],
+    seed: u32,
+    salt: u32,
+    score_of: impl Fn(usize) -> f32,
+) -> usize {
+    let mut ranked = [0usize; MAX_SLICES];
+    for index in 0..count {
+        ranked[index] = index;
     }
     for index in 1..count {
         let mut cursor = index;
-        while cursor > 0
-            && slices[by_brightness[cursor]].brightness
-                < slices[by_brightness[cursor - 1]].brightness
-        {
-            by_brightness.swap(cursor, cursor - 1);
+        while cursor > 0 {
+            let current = ranked[cursor];
+            let previous = ranked[cursor - 1];
+            let current_score = score_of(current);
+            let previous_score = score_of(previous);
+            let higher = current_score > previous_score
+                || (current_score == previous_score && current < previous);
+            if !higher {
+                break;
+            }
+            ranked.swap(cursor, cursor - 1);
             cursor -= 1;
         }
     }
 
-    let low_end = (count / 3).clamp(1, count);
-    let mid_end = ((count * 2) / 3).clamp(low_end, count);
-    let mut pools = [(0usize, count); LANES];
-    pools[LANE_LOW] = (0, low_end);
-    pools[LANE_MID] = (low_end.saturating_sub((count > 1) as usize), mid_end.max(low_end));
-    pools[LANE_HIGH] = (mid_end.saturating_sub((count > 2) as usize), count);
-    pools[LANE_EXTRA] = (0, count);
-    if pools[LANE_MID].1 <= pools[LANE_MID].0 {
-        pools[LANE_MID] = (0, count);
-    }
-    if pools[LANE_HIGH].1 <= pools[LANE_HIGH].0 {
-        pools[LANE_HIGH] = (0, count);
-    }
-
-    let mut chosen = [0usize; LANES];
-    let mut used = [false; MAX_SLICES];
-    for lane in 0..LANES {
-        let (start, end) = pools[lane];
-        let span = (end - start).max(1);
-        let mut pick = start + (hash01(seed, 900, lane as u32) * span as f32) as usize;
-        if pick >= end {
-            pick = end - 1;
-        }
-        let mut resolved = by_brightness[pick];
-        if lane == LANE_EXTRA {
-            resolved = longest_unused(slices, count, &used, seed);
-        } else if used[resolved] {
-            for offset in 1..count {
-                let candidate = by_brightness[(pick + offset) % count];
-                if !used[candidate] {
-                    resolved = candidate;
-                    break;
-                }
-            }
-        }
-        if count > 1 {
-            used[resolved] = true;
-        }
-        chosen[lane] = resolved;
-    }
-    chosen
-}
-
-fn longest_unused(slices: &[SliceInfo], count: usize, used: &[bool], seed: u32) -> usize {
-    let mut best = 0usize;
-    let mut best_len = 0usize;
-    let mut found = false;
-    for index in 0..count {
+    let best = score_of(ranked[0]);
+    let cutoff = best * 0.72;
+    let mut candidates = [0usize; 4];
+    let mut n = 0usize;
+    for slot in 0..count {
+        let index = ranked[slot];
         if used[index] {
             continue;
         }
-        let len = slices[index].end.saturating_sub(slices[index].start);
-        let jitter = (hash01(seed, 910, index as u32) * 64.0) as usize;
-        if !found || len + jitter > best_len {
-            best = index;
-            best_len = len + jitter;
-            found = true;
+        if n > 0 && score_of(index) < cutoff {
+            break;
+        }
+        candidates[n] = index;
+        n += 1;
+        if n == 4 {
+            break;
         }
     }
-    if found { best } else { 0 }
+    if n == 0 {
+        return ranked[0];
+    }
+    let choice = (hash01(seed, salt, 0) * n as f32) as usize;
+    candidates[choice.min(n - 1)]
+}
+
+fn spread_by_index(count: usize, seed: u32) -> [usize; LANES] {
+    let mut chosen = [0usize; LANES];
+    let mut used = [false; MAX_SLICES];
+    for lane in 0..LANES {
+        let start = (hash01(seed, 900, lane as u32) * count as f32) as usize % count;
+        let mut pick = start;
+        for offset in 0..count {
+            let candidate = (start + offset) % count;
+            if !used[candidate] {
+                pick = candidate;
+                break;
+            }
+        }
+        if count > 1 {
+            used[pick] = true;
+        }
+        chosen[lane] = pick;
+    }
+    chosen
 }
 
 fn lane_pitch(seed: u32, lane: usize, global: f32, sound_var: f32) -> f32 {
@@ -425,16 +522,93 @@ mod tests {
 
     fn dummy_slices(count: usize) -> Vec<SliceInfo> {
         (0..count)
-            .map(|index| SliceInfo {
-                start: index * 1000,
-                end: index * 1000 + 800 + index * 10,
-                peak: 0.8,
-                rms: 0.2,
-                brightness: index as f32 / count.max(1) as f32,
-                punch: 2.0,
-                norm_gain: 1.0,
+            .map(|index| {
+                let brightness = index as f32 / count.max(1) as f32;
+                SliceInfo {
+                    start: index * 1000,
+                    end: index * 1000 + 800 + index * 10,
+                    peak: 0.8,
+                    rms: 0.2,
+                    brightness,
+                    punch: 3.0,
+                    norm_gain: 1.0,
+                    low_ratio: 1.0 - brightness,
+                    mid_ratio: 0.35,
+                    high_ratio: brightness,
+                    seconds: 0.12,
+                }
             })
             .collect()
+    }
+
+    fn role_slice(
+        index: usize,
+        low: f32,
+        mid: f32,
+        high: f32,
+        seconds: f32,
+        brightness: f32,
+    ) -> SliceInfo {
+        SliceInfo {
+            start: index * 2000,
+            end: index * 2000 + 1000,
+            peak: 0.8,
+            rms: 0.2,
+            brightness,
+            punch: 4.0,
+            norm_gain: 1.0,
+            low_ratio: low,
+            mid_ratio: mid,
+            high_ratio: high,
+            seconds,
+        }
+    }
+
+    #[test]
+    fn lanes_follow_kick_snare_and_hat() {
+        let slices = vec![
+            role_slice(0, 0.86, 0.10, 0.04, 0.30, 0.08),
+            role_slice(1, 0.80, 0.14, 0.06, 0.28, 0.10),
+            role_slice(2, 0.12, 0.55, 0.33, 0.16, 0.45),
+            role_slice(3, 0.08, 0.50, 0.42, 0.14, 0.50),
+            role_slice(4, 0.04, 0.16, 0.80, 0.04, 0.85),
+            role_slice(5, 0.05, 0.20, 0.75, 0.05, 0.80),
+            role_slice(6, 0.22, 0.48, 0.30, 0.20, 0.40),
+        ];
+        let mut seen_low = [false; 2];
+        for seed in [1, 7, 40, 200, 999] {
+            let pattern = generate(
+                &slices,
+                &GenParams {
+                    seed,
+                    ..GenParams::default()
+                },
+            );
+            let low = pattern.lanes[LANE_LOW].slice;
+            let mid = pattern.lanes[LANE_MID].slice;
+            let high = pattern.lanes[LANE_HIGH].slice;
+            let extra = pattern.lanes[LANE_EXTRA].slice;
+            assert!(low <= 1, "seed {seed} put slice {low} on Low");
+            assert!(
+                high == 4 || high == 5,
+                "seed {seed} put slice {high} on High"
+            );
+            assert!(
+                mid == 2 || mid == 3 || mid == 6,
+                "seed {seed} put slice {mid} on Mid"
+            );
+            let mut ids = [low, mid, high, extra];
+            ids.sort_unstable();
+            assert!(
+                ids.windows(2).all(|pair| pair[0] != pair[1]),
+                "seed {seed} reused a slice: {ids:?}"
+            );
+            seen_low[low] = true;
+        }
+        assert!(
+            seen_low[0] && seen_low[1],
+            "seed should be able to swap the two kicks, saw {seen_low:?}"
+        );
     }
 
     #[test]

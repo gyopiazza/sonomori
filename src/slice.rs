@@ -12,6 +12,9 @@ pub const MAX_SLICES: usize = 48;
 pub struct OnsetAnalysis {
     hop: usize,
     flux: Vec<f32>,
+    /// RMS of each hop. Kept so slice edges can drop leading and trailing silence
+    /// without scanning the file a second time.
+    energy: Vec<f32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -40,6 +43,7 @@ pub fn analyze(mono: &[f32], sample_rate: f32) -> OnsetAnalysis {
         return OnsetAnalysis {
             hop,
             flux: Vec::new(),
+            energy: Vec::new(),
         };
     }
 
@@ -60,7 +64,7 @@ pub fn analyze(mono: &[f32], sample_rate: f32) -> OnsetAnalysis {
         flux[index] = (energy[index] - energy[index - 1]).max(0.0);
     }
 
-    OnsetAnalysis { hop, flux }
+    OnsetAnalysis { hop, flux, energy }
 }
 
 /// Slice boundaries as half-open sample ranges `[start, end)`.
@@ -73,10 +77,30 @@ pub fn slices_for_sensitivity(
     if frame_count < 8 {
         return Vec::new();
     }
-    if analysis.flux.len() < 4 || analysis.hop == 0 {
-        return even_slices(frame_count, 8);
-    }
 
+    let mut spans = if analysis.flux.len() < 4 || analysis.hop == 0 {
+        even_slices(frame_count, 8)
+    } else {
+        onset_spans(analysis, frame_count, sample_rate, sensitivity)
+    };
+    // Life throws away the silence around a hit. A quiet tail would otherwise
+    // dilute the band energies that decide which lane a slice belongs to.
+    // Splitting a long gap can also leave spans that contain no hit at all.
+    trim_silence(&mut spans, analysis, sample_rate, frame_count);
+    drop_silent(&mut spans, analysis);
+    if spans.is_empty() {
+        even_slices(frame_count, 8)
+    } else {
+        spans
+    }
+}
+
+fn onset_spans(
+    analysis: &OnsetAnalysis,
+    frame_count: usize,
+    sample_rate: f32,
+    sensitivity: f32,
+) -> Vec<(usize, usize)> {
     let sensitivity = sensitivity.clamp(0.0, 1.0);
     let hop = analysis.hop;
     let flux = &analysis.flux;
@@ -151,6 +175,96 @@ pub fn slices_for_sensitivity(
     } else {
         spans
     }
+}
+
+/// Pull each span in to the hops that actually contain energy.
+///
+/// The floor is relative to that span's own peak, so a quiet hit is not judged
+/// against a loud one. A short hold keeps the tail after it crosses the floor.
+fn trim_silence(
+    spans: &mut [(usize, usize)],
+    analysis: &OnsetAnalysis,
+    sample_rate: f32,
+    frame_count: usize,
+) {
+    let hop = analysis.hop;
+    if hop == 0 || analysis.energy.is_empty() || sample_rate <= 0.0 {
+        return;
+    }
+    let min_len = ((0.025 * sample_rate) as usize).max(hop);
+    let hold = (0.025 * sample_rate) as usize;
+    let hops = analysis.energy.len();
+
+    for span in spans.iter_mut() {
+        let start = span.0.min(frame_count);
+        let end = span.1.min(frame_count);
+        if end.saturating_sub(start) <= min_len {
+            continue;
+        }
+        let first = (start / hop).min(hops - 1);
+        let last = ((end - 1) / hop).min(hops - 1);
+        if last < first {
+            continue;
+        }
+
+        let mut peak = 0.0f32;
+        for value in &analysis.energy[first..=last] {
+            peak = peak.max(*value);
+        }
+        if peak < 1.0e-5 {
+            continue;
+        }
+        let floor = peak * 0.01;
+
+        let mut loud_first = None;
+        let mut loud_last = 0usize;
+        for index in first..=last {
+            if analysis.energy[index] >= floor {
+                if loud_first.is_none() {
+                    loud_first = Some(index);
+                }
+                loud_last = index;
+            }
+        }
+        let Some(loud_first) = loud_first else {
+            continue;
+        };
+
+        // Stay inside the original span so neighboring slices cannot overlap.
+        let mut new_start = (loud_first * hop).max(start);
+        let mut new_end = ((loud_last + 1) * hop + hold).min(end);
+        if new_end.saturating_sub(new_start) < min_len {
+            new_end = (new_start + min_len).min(end);
+            if new_end.saturating_sub(new_start) < min_len {
+                new_start = end.saturating_sub(min_len).max(start);
+                new_end = end;
+            }
+        }
+        if new_end > new_start + 1 {
+            *span = (new_start, new_end);
+        }
+    }
+}
+
+fn drop_silent(spans: &mut Vec<(usize, usize)>, analysis: &OnsetAnalysis) {
+    let hop = analysis.hop;
+    if hop == 0 || analysis.energy.is_empty() {
+        return;
+    }
+    let hops = analysis.energy.len();
+    spans.retain(|&(start, end)| {
+        if end <= start {
+            return false;
+        }
+        let first = (start / hop).min(hops - 1);
+        let last = ((end - 1) / hop).min(hops - 1);
+        if last < first {
+            return false;
+        }
+        analysis.energy[first..=last]
+            .iter()
+            .any(|value| *value >= 1.0e-4)
+    });
 }
 
 fn even_slices(frame_count: usize, count: usize) -> Vec<(usize, usize)> {
@@ -268,12 +382,34 @@ mod tests {
             "expected at least 4 slices, got {}",
             slices.len()
         );
-        assert_eq!(slices[0].0, 0);
+        for time in [20.0, 280.0, 540.0, 860.0] {
+            let sample = (time / 1000.0 * sample_rate) as usize;
+            assert!(
+                slices.iter().any(|(start, end)| sample >= *start && sample < *end),
+                "click at {time} ms is not inside a slice: {slices:?}"
+            );
+        }
         for pair in slices.windows(2) {
-            assert!(pair[1].0 >= pair[0].1 || pair[1].0 > pair[0].0);
+            assert!(pair[1].0 >= pair[0].1);
             assert!(pair[0].1 > pair[0].0);
         }
-        assert_eq!(slices.last().unwrap().1, mono.len());
+        let last_click = (0.860 * sample_rate) as usize;
+        assert!(slices.last().unwrap().1 < last_click + (0.2 * sample_rate) as usize);
+        assert!(slices.last().unwrap().1 < mono.len());
+    }
+
+    #[test]
+    fn trailing_silence_is_cut_from_the_slice() {
+        let sample_rate = 44_100.0;
+        let mono = click_train(sample_rate, &[80.0], 0.9);
+        let analysis = analyze(&mono, sample_rate);
+        let slices = slices_for_sensitivity(&analysis, mono.len(), sample_rate, 0.5);
+        assert!(!slices.is_empty());
+        let end = slices.last().unwrap().1;
+        assert!(
+            end < (0.25 * sample_rate) as usize,
+            "silence after the hit was kept, end sample {end}"
+        );
     }
 
     #[test]
