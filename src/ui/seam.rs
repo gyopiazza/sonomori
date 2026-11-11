@@ -30,8 +30,44 @@ fn visit(dir: &std::path::Path, ui: &std::path::Path, hits: &mut Vec<String>) {
             continue;
         }
         let text = std::fs::read_to_string(&path).unwrap();
-        if text.contains("egui") || text.contains("rune") {
+        if names_a_library(&text) {
             hits.push(path.display().to_string());
         }
     }
+}
+
+fn names_a_library(text: &str) -> bool {
+    text.contains("egui") || text.contains("rune") || has_word(text, "iced")
+}
+
+/// `sliced` contains the letters of the iced crate name. Match the word.
+fn has_word(text: &str, word: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let word = word.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let needle = word.as_bytes();
+    let mut start = 0;
+    while let Some(found) = lower[start..].find(&word) {
+        let at = start + found;
+        let before = at == 0 || !is_ident(bytes[at - 1]);
+        let after_at = at + needle.len();
+        let after = after_at >= bytes.len() || !is_ident(bytes[after_at]);
+        if before && after {
+            return true;
+        }
+        start = at + needle.len();
+    }
+    false
+}
+
+fn is_ident(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+#[test]
+fn iced_is_a_word_and_sliced_is_not() {
+    assert!(names_a_library("calls iced here"));
+    assert!(names_a_library("Iced::widget"));
+    assert!(!names_a_library("sliced transient"));
+    assert!(!names_a_library("the slices"));
 }

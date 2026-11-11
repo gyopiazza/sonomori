@@ -21,9 +21,14 @@ mod rune;
 #[cfg(all(ui_rune, target_os = "macos"))]
 use rune as backend;
 
+#[cfg(ui_iced)]
+mod iced;
+#[cfg(ui_iced)]
+use iced as backend;
+
 #[cfg(all(ui_rune, not(target_os = "macos")))]
 compile_error!(
-    "src/ui/ui.rs selects the macOS editor backend. Set BACKEND to Ui::Egui to build on this target."
+    "src/ui/ui.rs selects the macOS editor backend. Set BACKEND to Ui::Egui or Ui::Iced to build on this target."
 );
 
 pub use backend::PluginEditor;

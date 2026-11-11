@@ -16,6 +16,16 @@ atomic_float = "1.1"
 egui = { version = "0.37.0", features = ["default_fonts"] }
 nice-plug = { version = "0.4.2", features = ["standalone"] }
 nice-plug-egui = "0.6.0"
+# wgpu only. The software renderer redraws the whole window on macOS and
+# spikes the CPU while the playhead is moving. Canvas is the waveform path.
+# The thread pool is the executor the poll subscription needs. Fira Sans is
+# the embedded UI face.
+nice-plug-iced = { version = "0.5.0", default-features = false, features = [
+    "canvas",
+    "fira-sans",
+    "thread-pool",
+    "wgpu",
+] }
 parking_lot = "0.12"
 rfd = "0.15"
 rtrb = "0.4"

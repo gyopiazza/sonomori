@@ -105,7 +105,7 @@ SOFTWARE.
 
 <https://github.com/micahrj/clap-sys>
 
-## nice-plug 0.4.2, nice-plug-core 0.4.2, and nice-plug-egui 0.6.0
+## nice-plug 0.4.2, nice-plug-core 0.4.2, nice-plug-egui 0.6.0, and nice-plug-iced 0.5.0
 
 Used under the ISC license.
 
@@ -555,6 +555,21 @@ License 1.1) is not included. That font is compiled only if
 
 The Rune editor (git revision `bba30a6`) embeds Inter Regular, Medium, and
 SemiBold on native builds. IBM Plex Mono is not part of that native set.
+
+The iced editor embeds Fira Sans Regular from `iced_graphics` 0.14.0 when
+that editor is the one linked. The egui and Rune binaries do not contain it.
+
+### Fira Sans
+
+Embedded from `FiraSans-Regular.ttf` in `iced_graphics` 0.14.0.
+
+```
+Digitized data copyright 2012-2016, The Mozilla Foundation and Telefonica S.A.
+Fira Sans is a trademark of The Mozilla Corporation.
+```
+
+Licensed under the SIL Open Font License, Version 1.1. The license text is
+included with Inter below.
 
 ### Ubuntu Light
 
