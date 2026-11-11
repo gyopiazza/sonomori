@@ -8,11 +8,16 @@
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use nice_plug::context::gui::GuiContext;
 use nice_plug::prelude::{FloatParam, IntParam, Param, ParamSetter};
 use nice_plug_iced::iced::widget::canvas::{self, Path, Stroke};
-use nice_plug_iced::iced::widget::{button, column, container, row, stack, text, text_input};
+use nice_plug_iced::iced::widget::{
+    button, column, container, lazy, row, stack, text, text_input,
+};
 use nice_plug_iced::iced::{
     self, Element, Length, Pixels, PollSubNotifier, Rectangle, Renderer, Subscription, Task, Theme,
 };
@@ -45,6 +50,26 @@ const TEAL: Color = Color::rgb(86, 196, 184);
 
 type El<'a> = Element<'a, Message, Theme, Renderer>;
 
+struct Counters {
+    views: AtomicU64,
+    view_ns: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    reuse: AtomicU64,
+    built: AtomicU64,
+    chrome: AtomicU64,
+}
+
+static COUNTERS: Counters = Counters {
+    views: AtomicU64::new(0),
+    view_ns: AtomicU64::new(0),
+    hits: AtomicU64::new(0),
+    misses: AtomicU64::new(0),
+    reuse: AtomicU64::new(0),
+    built: AtomicU64::new(0),
+    chrome: AtomicU64::new(0),
+};
+
 pub(super) struct Screen {
     editor: RefCell<PersistentState<SonomoriEditor>>,
     ctx: IcedNiceContext,
@@ -63,6 +88,13 @@ struct Chrome {
     wants_frame: Cell<bool>,
     ids: Cell<u32>,
     sliders: Cell<u32>,
+    /// Mark buffers kept across frames so a steady loop does not allocate.
+    mark_pool: RefCell<Vec<Vec<Mark>>>,
+    /// Last cached-mesh fingerprint for each canvas, in paint order.
+    slots: RefCell<Vec<u64>>,
+    slot_cursor: Cell<usize>,
+    input_epoch: Cell<u64>,
+    stats_at: Cell<Instant>,
     #[cfg(test)]
     log: RefCell<LayoutLog>,
 }
@@ -164,20 +196,40 @@ impl Screen {
     }
 
     pub(super) fn view(&self) -> El<'_> {
+        let started = Instant::now();
         self.chrome.begin_frame();
-        let children = {
+        let (key, pump) = {
             let mut editor = self.editor.borrow_mut();
-            let gui = editor.gui();
-            let mut face = Face {
-                chrome: &self.chrome,
-                children: Vec::new(),
-            };
-            if let Some(gui) = gui {
-                let setter = gui.param_setter();
-                editor.show(&mut face, &setter);
-            }
-            face.children
+            editor.prepare();
+            let base = editor.chrome_key();
+            let path_changed = self.chrome.path_differs(editor.path_input());
+            let pump = editor.wants_pump();
+            drop(editor);
+            let pending = path_changed
+                || self.chrome.pressed.get().is_some()
+                || self.chrome.canvas.get().is_some();
+            let key = if pending { self.chrome.bump(base) } else { base };
+            (key, pump)
         };
+        if pump {
+            // Loading and the file panel need another look. Playback does not:
+            // the audio thread wakes the editor when the playhead actually moves.
+            self.repaint.notify();
+        }
+
+        // The waveform and the sliders do not change on a playhead step. `lazy`
+        // keeps their widget trees, so a step only rebuilds the grid and the meter.
+        let top = lazy(key, |_| self.rebuild_top());
+        let sliders = lazy(key, |_| self.rebuild_sliders());
+        let pattern = self.with_editor(|editor, face| editor.paint_grid(face));
+        let readout = self.with_editor(|editor, face| editor.paint_readout(face));
+
+        let mut children = Vec::with_capacity(pattern.len() + readout.len() + 2);
+        children.push(top.into());
+        children.extend(pattern);
+        children.push(sliders.into());
+        children.extend(readout);
+
         let root = container(
             column(children)
                 .spacing(COLUMN_GAP)
@@ -189,7 +241,68 @@ impl Screen {
         .height(Length::Fill)
         .style(paper);
         self.chrome.finish_frame(&self.repaint);
+        self.note_frame(started);
         root.into()
+    }
+
+    fn rebuild_top(&self) -> El<'static> {
+        COUNTERS.chrome.fetch_add(1, Ordering::Relaxed);
+        let mut editor = self.editor.borrow_mut();
+        let gui = editor.gui();
+        let mut face = Face {
+            chrome: &self.chrome,
+            children: Vec::new(),
+        };
+        if let Some(gui) = gui {
+            let setter = gui.param_setter();
+            editor.paint_top(&mut face, &setter);
+        }
+        drop(editor);
+        self.chrome.end_input();
+        if self.chrome.wants_frame.get() {
+            self.repaint.notify();
+        }
+        face.into_column()
+    }
+
+    fn rebuild_sliders(&self) -> El<'static> {
+        COUNTERS.chrome.fetch_add(1, Ordering::Relaxed);
+        let mut editor = self.editor.borrow_mut();
+        let gui = editor.gui();
+        let mut face = Face {
+            chrome: &self.chrome,
+            children: Vec::new(),
+        };
+        if let Some(gui) = gui {
+            let setter = gui.param_setter();
+            editor.paint_sliders(&mut face, &setter);
+        }
+        face.into_column()
+    }
+
+    fn with_editor(
+        &self,
+        body: impl FnOnce(&mut crate::editor::SonomoriEditor, &mut Face<'_>),
+    ) -> Vec<El<'static>> {
+        let mut editor = self.editor.borrow_mut();
+        let mut face = Face {
+            chrome: &self.chrome,
+            children: Vec::new(),
+        };
+        body(&mut editor, &mut face);
+        face.children
+    }
+
+    fn note_frame(&self, started: Instant) {
+        COUNTERS.views.fetch_add(1, Ordering::Relaxed);
+        COUNTERS
+            .view_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if self.chrome.stats_at.get().elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.chrome.stats_at.set(Instant::now());
+        write_stats();
     }
 
     pub(super) fn subscription(_state: &Self) -> Subscription<Message> {
@@ -204,6 +317,36 @@ impl Screen {
 impl Drop for Screen {
     fn drop(&mut self) {
         self.editor.borrow_mut().detach_gui();
+        write_stats();
+    }
+}
+
+fn stats_path() -> Option<&'static str> {
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    PATH.get_or_init(|| std::env::var("SONOMORI_STATS").ok())
+        .as_deref()
+}
+
+/// Cumulative frame counters for the profile script. Absent unless
+/// `SONOMORI_STATS` is set, and rewritten at most once a second.
+fn write_stats() {
+    let Some(path) = stats_path() else {
+        return;
+    };
+    let views = COUNTERS.views.load(Ordering::Relaxed);
+    let nanos = COUNTERS.view_ns.load(Ordering::Relaxed);
+    let mean = if views == 0 { 0 } else { nanos / views };
+    let body = format!(
+        "views {views}\nview_ns_mean {mean}\ngeom_hits {}\ngeom_misses {}\nmark_reuse {}\nmark_build {}\nchrome_rebuilds {}\n",
+        COUNTERS.hits.load(Ordering::Relaxed),
+        COUNTERS.misses.load(Ordering::Relaxed),
+        COUNTERS.reuse.load(Ordering::Relaxed),
+        COUNTERS.built.load(Ordering::Relaxed),
+        COUNTERS.chrome.load(Ordering::Relaxed),
+    );
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }
 
@@ -240,6 +383,11 @@ impl Chrome {
             wants_frame: Cell::new(false),
             ids: Cell::new(0),
             sliders: Cell::new(0),
+            mark_pool: RefCell::new(Vec::new()),
+            slots: RefCell::new(Vec::new()),
+            slot_cursor: Cell::new(0),
+            input_epoch: Cell::new(0),
+            stats_at: Cell::new(Instant::now()),
             #[cfg(test)]
             log: RefCell::new(LayoutLog::default()),
         }
@@ -248,17 +396,67 @@ impl Chrome {
     fn begin_frame(&self) {
         self.ids.set(0);
         self.sliders.set(0);
+        self.slot_cursor.set(0);
         self.wants_frame.set(false);
         #[cfg(test)]
         self.log.borrow_mut().clear();
     }
 
     fn finish_frame(&self, repaint: &PollSubNotifier) {
-        self.pressed.set(None);
-        self.canvas.set(None);
         if self.wants_frame.get() {
             repaint.notify();
         }
+    }
+
+    fn end_input(&self) {
+        self.pressed.set(None);
+        self.canvas.set(None);
+    }
+
+    fn path_differs(&self, path: &str) -> bool {
+        *self.path.borrow() != path
+    }
+
+    fn bump(&self, base: u64) -> u64 {
+        let epoch = self.input_epoch.get().wrapping_add(1);
+        self.input_epoch.set(epoch);
+        mix(base, epoch)
+    }
+
+    fn rent_marks(&self) -> Vec<Mark> {
+        self.mark_pool
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(40))
+    }
+
+    fn recycle_marks(&self, mut marks: Vec<Mark>) {
+        marks.clear();
+        self.mark_pool.borrow_mut().push(marks);
+    }
+
+    /// Keep the tessellated mesh when this canvas paints the same base marks.
+    /// The returned vec is empty on a hit so the caller does not retain a copy.
+    fn resolve_marks(&self, fingerprint: u64, marks: Vec<Mark>) -> Vec<Mark> {
+        let index = self.slot_cursor.get();
+        self.slot_cursor.set(index + 1);
+        let mut slots = self.slots.borrow_mut();
+        if slots.len() > index && slots[index] == fingerprint {
+            drop(slots);
+            self.recycle_marks(marks);
+            COUNTERS.reuse.fetch_add(1, Ordering::Relaxed);
+            return Vec::new();
+        }
+        if slots.len() == index {
+            slots.push(fingerprint);
+        } else if slots.len() > index {
+            slots[index] = fingerprint;
+        } else {
+            slots.resize(index, 0);
+            slots.push(fingerprint);
+        }
+        COUNTERS.built.fetch_add(1, Ordering::Relaxed);
+        marks
     }
 
     fn alloc(&self) -> u32 {
@@ -446,7 +644,7 @@ impl Surface for Face<'_> {
     }
 
     fn progress(&mut self, fraction: f32, text_value: &str) {
-        let mut painter = MarkPainter::default();
+        let mut painter = MarkPainter::new(self.chrome.rent_marks());
         let rect = Rect::from_min_size(Point { x: 0.0, y: 0.0 }, VIRTUAL_WIDTH, METER_HEIGHT);
         painter.fill(rect, 4.0, TRACK);
         let width = (fraction.clamp(0.0, 1.0) * VIRTUAL_WIDTH).max(0.0);
@@ -458,9 +656,20 @@ impl Surface for Face<'_> {
             );
         }
         painter.finish();
+        let fingerprint = mix(painter.fingerprint, METER_HEIGHT.to_bits() as u64);
+        let marks = self.chrome.resolve_marks(fingerprint, painter.marks);
         self.push(
             stack([
-                marks_canvas(painter.marks, VIRTUAL_WIDTH, METER_HEIGHT, None).into(),
+                marks_canvas(
+                    marks,
+                    None,
+                    VIRTUAL_WIDTH,
+                    METER_HEIGHT,
+                    None,
+                    fingerprint,
+                    MARK_HASH,
+                )
+                .into(),
                 text(text_value.to_owned())
                     .size(BODY)
                     .color(ink(TEXT))
@@ -497,10 +706,23 @@ impl Surface for Face<'_> {
                 .and_then(|(stored, x, y)| (stored == id).then_some(Point { x, y }))
         });
         let rect = Rect::from_min_size(Point { x: 0.0, y: 0.0 }, virtual_w, height);
-        let mut painter = MarkPainter::default();
+        let mut painter = MarkPainter::new(self.chrome.rent_marks());
         let result = draw(rect, &mut painter, click);
         painter.finish();
-        let mut widget = marks_canvas(painter.marks, virtual_w, height, id);
+        let mut fingerprint = mix(painter.fingerprint, virtual_w.to_bits() as u64);
+        fingerprint = mix(fingerprint, height.to_bits() as u64);
+        let overlay_fp = painter.overlay_fp;
+        let overlay = painter.overlay.take();
+        let marks = self.chrome.resolve_marks(fingerprint, painter.marks);
+        let mut widget = marks_canvas(
+            marks,
+            overlay,
+            virtual_w,
+            height,
+            id,
+            fingerprint,
+            overlay_fp,
+        );
         widget = match breadth {
             Breadth::Fixed(width) => widget.width(Length::Fixed(width)),
             Breadth::Fill => widget.width(Length::Fill),
@@ -583,6 +805,7 @@ fn drag_norm(origin_norm: f32, origin_x: f32, x: f32, width: f32, shift: bool) -
     }
 }
 
+#[derive(Clone)]
 enum Mark {
     Fill {
         x: f32,
@@ -606,10 +829,42 @@ enum Mark {
     },
 }
 
-#[derive(Default)]
+const MARK_HASH: u64 = 0xcbf29ce484222325;
+const MARK_PRIME: u64 = 0x100000001b3;
+
+fn mix(hash: u64, value: u64) -> u64 {
+    (hash ^ value).wrapping_mul(MARK_PRIME)
+}
+
+fn color_bits(color: Color) -> u64 {
+    u32::from_le_bytes([color.r, color.g, color.b, color.a]) as u64
+}
+
 struct MarkPainter {
     marks: Vec<Mark>,
     lines: Option<LineBatch>,
+    fingerprint: u64,
+    /// Playhead. Kept out of `fingerprint` so the cells under it stay cached.
+    overlay: Option<Mark>,
+    overlay_fp: u64,
+}
+
+impl MarkPainter {
+    fn new(marks: Vec<Mark>) -> Self {
+        Self {
+            marks,
+            lines: None,
+            fingerprint: MARK_HASH,
+            overlay: None,
+            overlay_fp: MARK_HASH,
+        }
+    }
+}
+
+impl Default for MarkPainter {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
 }
 
 struct LineBatch {
@@ -645,6 +900,13 @@ impl Painter for MarkPainter {
         if w < 0.5 || h < 0.5 {
             return;
         }
+        self.fingerprint = mix(self.fingerprint, 1);
+        self.fingerprint = mix(self.fingerprint, rect.left().to_bits() as u64);
+        self.fingerprint = mix(self.fingerprint, rect.top().to_bits() as u64);
+        self.fingerprint = mix(self.fingerprint, w.to_bits() as u64);
+        self.fingerprint = mix(self.fingerprint, h.to_bits() as u64);
+        self.fingerprint = mix(self.fingerprint, radius.to_bits() as u64);
+        self.fingerprint = mix(self.fingerprint, color_bits(color));
         self.marks.push(Mark::Fill {
             x: rect.left(),
             y: rect.top(),
@@ -662,12 +924,20 @@ impl Painter for MarkPainter {
             .is_some_and(|batch| batch.width == width && batch.color == color);
         if !same {
             self.flush_lines();
+            self.fingerprint = mix(self.fingerprint, 2);
+            self.fingerprint = mix(self.fingerprint, width.to_bits() as u64);
+            self.fingerprint = mix(self.fingerprint, color_bits(color));
             self.lines = Some(LineBatch {
                 width,
                 color,
-                segments: Vec::new(),
+                // The waveform is 512 columns. One allocation covers it.
+                segments: Vec::with_capacity(512),
             });
         }
+        self.fingerprint = mix(self.fingerprint, from.x.to_bits() as u64);
+        self.fingerprint = mix(self.fingerprint, from.y.to_bits() as u64);
+        self.fingerprint = mix(self.fingerprint, to.x.to_bits() as u64);
+        self.fingerprint = mix(self.fingerprint, to.y.to_bits() as u64);
         if let Some(batch) = self.lines.as_mut() {
             batch.segments.push([from.x, from.y, to.x, to.y]);
         }
@@ -675,6 +945,14 @@ impl Painter for MarkPainter {
 
     fn text_centered(&mut self, at: Point, text_value: &str, size: f32, color: Color) {
         self.flush_lines();
+        self.fingerprint = mix(self.fingerprint, 3);
+        self.fingerprint = mix(self.fingerprint, at.x.to_bits() as u64);
+        self.fingerprint = mix(self.fingerprint, at.y.to_bits() as u64);
+        self.fingerprint = mix(self.fingerprint, size.to_bits() as u64);
+        self.fingerprint = mix(self.fingerprint, color_bits(color));
+        for byte in text_value.bytes() {
+            self.fingerprint = mix(self.fingerprint, byte as u64);
+        }
         self.marks.push(Mark::Text {
             x: at.x,
             y: at.y,
@@ -683,39 +961,77 @@ impl Painter for MarkPainter {
             text: text_value.to_owned(),
         });
     }
+
+    fn highlight(&mut self, rect: Rect, radius: f32, color: Color) {
+        self.flush_lines();
+        let (w, h) = (rect.width(), rect.height());
+        if w < 0.5 || h < 0.5 {
+            return;
+        }
+        self.overlay_fp = mix(self.overlay_fp, rect.left().to_bits() as u64);
+        self.overlay_fp = mix(self.overlay_fp, rect.top().to_bits() as u64);
+        self.overlay_fp = mix(self.overlay_fp, w.to_bits() as u64);
+        self.overlay_fp = mix(self.overlay_fp, h.to_bits() as u64);
+        self.overlay_fp = mix(self.overlay_fp, radius.to_bits() as u64);
+        self.overlay_fp = mix(self.overlay_fp, color_bits(color));
+        self.overlay = Some(Mark::Fill {
+            x: rect.left(),
+            y: rect.top(),
+            w,
+            h,
+            radius,
+            color,
+        });
+    }
 }
 
 struct Marks {
     marks: Vec<Mark>,
+    overlay: Option<Mark>,
     virtual_w: f32,
     id: Option<u32>,
+    fingerprint: u64,
+    overlay_fp: u64,
 }
 
 #[derive(Default)]
-struct Arm {
+struct MarksState {
     armed: bool,
+    cache: canvas::Cache,
+    overlay_cache: canvas::Cache,
+    fingerprint: Cell<u64>,
+    overlay_fp: Cell<u64>,
+    /// Last base marks. A resize retessellates from here when the live frame
+    /// recycled its buffer after a fingerprint hit.
+    stored: RefCell<Vec<Mark>>,
 }
 
 fn marks_canvas(
     marks: Vec<Mark>,
+    overlay: Option<Mark>,
     virtual_w: f32,
     height: f32,
     id: Option<u32>,
+    fingerprint: u64,
+    overlay_fp: u64,
 ) -> canvas::Canvas<Marks, Message, Theme, Renderer> {
     let _ = height;
     iced::widget::canvas(Marks {
         marks,
+        overlay,
         virtual_w,
         id,
+        fingerprint,
+        overlay_fp,
     })
 }
 
 impl canvas::Program<Message, Theme, Renderer> for Marks {
-    type State = Arm;
+    type State = MarksState;
 
     fn update(
         &self,
-        state: &mut Arm,
+        state: &mut MarksState,
         event: &iced::Event,
         bounds: Rectangle,
         cursor: iced::mouse::Cursor,
@@ -753,77 +1069,56 @@ impl canvas::Program<Message, Theme, Renderer> for Marks {
 
     fn draw(
         &self,
-        _state: &Arm,
+        state: &MarksState,
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,
         _cursor: iced::mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
-        for mark in &self.marks {
-            match mark {
-                Mark::Fill {
-                    x,
-                    y,
-                    w,
-                    h,
-                    radius,
-                    color,
-                } => {
-                    let x = scale_x(self.virtual_w, bounds.width, *x);
-                    let w = scale_x(self.virtual_w, bounds.width, *w);
-                    fill_round(&mut frame, x, *y, w, *h, *radius, *color);
-                }
-                Mark::Lines {
-                    width,
-                    color,
-                    segments,
-                } => {
-                    let path = Path::new(|builder| {
-                        for segment in segments {
-                            builder.move_to(iced::Point::new(
-                                scale_x(self.virtual_w, bounds.width, segment[0]),
-                                segment[1],
-                            ));
-                            builder.line_to(iced::Point::new(
-                                scale_x(self.virtual_w, bounds.width, segment[2]),
-                                segment[3],
-                            ));
-                        }
-                    });
-                    frame.stroke(
-                        &path,
-                        Stroke::default().with_color(ink(*color)).with_width(*width),
-                    );
-                }
-                Mark::Text {
-                    x,
-                    y,
-                    size,
-                    color,
-                    text,
-                } => {
-                    frame.fill_text(canvas::Text {
-                        content: text.clone(),
-                        position: iced::Point::new(scale_x(self.virtual_w, bounds.width, *x), *y),
-                        max_width: bounds.width,
-                        color: ink(*color),
-                        size: Pixels(*size),
-                        line_height: iced::widget::text::LineHeight::Relative(1.0),
-                        font: iced::Font::default(),
-                        align_x: iced::widget::text::Alignment::Center,
-                        align_y: iced::alignment::Vertical::Center,
-                        shaping: iced::widget::text::Shaping::Basic,
-                    });
-                }
-            }
+        // The widget state outlives this program. Unchanged marks keep the
+        // tessellated mesh. The playhead is a second mesh so a step does not
+        // throw away the cells underneath it.
+        if state.fingerprint.get() != self.fingerprint {
+            state.cache.clear();
+            state.fingerprint.set(self.fingerprint);
+            state.stored.borrow_mut().clone_from(&self.marks);
+            COUNTERS.misses.fetch_add(1, Ordering::Relaxed);
+        } else {
+            COUNTERS.hits.fetch_add(1, Ordering::Relaxed);
         }
-        vec![frame.into_geometry()]
+        let base = state.cache.draw(renderer, bounds.size(), |frame| {
+            if self.marks.is_empty() {
+                paint_marks(
+                    frame,
+                    &state.stored.borrow(),
+                    self.virtual_w,
+                    bounds.width,
+                );
+            } else {
+                paint_marks(frame, &self.marks, self.virtual_w, bounds.width);
+            }
+        });
+        let Some(overlay) = &self.overlay else {
+            return vec![base];
+        };
+        if state.overlay_fp.get() != self.overlay_fp {
+            state.overlay_cache.clear();
+            state.overlay_fp.set(self.overlay_fp);
+        }
+        let highlight = state.overlay_cache.draw(renderer, bounds.size(), |frame| {
+            paint_marks(
+                frame,
+                std::slice::from_ref(overlay),
+                self.virtual_w,
+                bounds.width,
+            );
+        });
+        vec![base, highlight]
     }
 
     fn mouse_interaction(
         &self,
-        _state: &Arm,
+        _state: &MarksState,
         bounds: Rectangle,
         cursor: iced::mouse::Cursor,
     ) -> iced::mouse::Interaction {
@@ -831,6 +1126,67 @@ impl canvas::Program<Message, Theme, Renderer> for Marks {
             iced::mouse::Interaction::Pointer
         } else {
             iced::mouse::Interaction::default()
+        }
+    }
+}
+
+fn paint_marks(frame: &mut canvas::Frame, marks: &[Mark], virtual_w: f32, bounds_w: f32) {
+    for mark in marks {
+        match mark {
+            Mark::Fill {
+                x,
+                y,
+                w,
+                h,
+                radius,
+                color,
+            } => {
+                let x = scale_x(virtual_w, bounds_w, *x);
+                let w = scale_x(virtual_w, bounds_w, *w);
+                fill_round(frame, x, *y, w, *h, *radius, *color);
+            }
+            Mark::Lines {
+                width,
+                color,
+                segments,
+            } => {
+                let path = Path::new(|builder| {
+                    for segment in segments {
+                        builder.move_to(iced::Point::new(
+                            scale_x(virtual_w, bounds_w, segment[0]),
+                            segment[1],
+                        ));
+                        builder.line_to(iced::Point::new(
+                            scale_x(virtual_w, bounds_w, segment[2]),
+                            segment[3],
+                        ));
+                    }
+                });
+                frame.stroke(
+                    &path,
+                    Stroke::default().with_color(ink(*color)).with_width(*width),
+                );
+            }
+            Mark::Text {
+                x,
+                y,
+                size,
+                color,
+                text,
+            } => {
+                frame.fill_text(canvas::Text {
+                    content: text.clone(),
+                    position: iced::Point::new(scale_x(virtual_w, bounds_w, *x), *y),
+                    max_width: bounds_w,
+                    color: ink(*color),
+                    size: Pixels(*size),
+                    line_height: iced::widget::text::LineHeight::Relative(1.0),
+                    font: iced::Font::default(),
+                    align_x: iced::widget::text::Alignment::Center,
+                    align_y: iced::alignment::Vertical::Center,
+                    shaping: iced::widget::text::Shaping::Basic,
+                });
+            }
         }
     }
 }
@@ -867,6 +1223,8 @@ struct Track {
 struct TrackState {
     dragging: bool,
     previous: Option<iced::core::mouse::Click>,
+    cache: canvas::Cache,
+    fraction_bits: Cell<u32>,
 }
 
 impl canvas::Program<Message, Theme, Renderer> for Track {
@@ -959,28 +1317,26 @@ impl canvas::Program<Message, Theme, Renderer> for Track {
 
     fn draw(
         &self,
-        _state: &TrackState,
+        state: &TrackState,
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,
         _cursor: iced::mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
-        let radius = TRACK_HEIGHT * 0.5;
-        fill_round(
-            &mut frame,
-            0.0,
-            0.0,
-            bounds.width,
-            bounds.height,
-            radius,
-            TRACK,
-        );
-        let fill_w = (self.fraction.clamp(0.0, 1.0) * bounds.width).max(0.0);
-        if fill_w >= 0.5 {
-            fill_round(&mut frame, 0.0, 0.0, fill_w, bounds.height, radius, TEAL);
+        let bits = self.fraction.clamp(0.0, 1.0).to_bits();
+        if state.fraction_bits.get() != bits {
+            state.cache.clear();
+            state.fraction_bits.set(bits);
         }
-        vec![frame.into_geometry()]
+        let geometry = state.cache.draw(renderer, bounds.size(), |frame| {
+            let radius = TRACK_HEIGHT * 0.5;
+            fill_round(frame, 0.0, 0.0, bounds.width, bounds.height, radius, TRACK);
+            let fill_w = (self.fraction.clamp(0.0, 1.0) * bounds.width).max(0.0);
+            if fill_w >= 0.5 {
+                fill_round(frame, 0.0, 0.0, fill_w, bounds.height, radius, TEAL);
+            }
+        });
+        vec![geometry]
     }
 
     fn mouse_interaction(
@@ -1522,6 +1878,23 @@ mod tests {
         let norm = drag_norm(0.62, 100.0, 110.0, 400.0, true);
         assert!((norm - (0.62 + 10.0 * super::GRANULAR_DRAG)).abs() < 1.0e-6);
         assert!((drag_norm(0.62, 100.0, 80.0, 200.0, false) - 0.4).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn highlight_stays_out_of_the_cached_fingerprint() {
+        use crate::ui::{Color, Painter, Point, Rect};
+
+        let rect = Rect::from_min_size(Point { x: 0.0, y: 0.0 }, 10.0, 8.0);
+        let mut plain = super::MarkPainter::default();
+        plain.fill(rect, 2.0, Color::rgb(38, 40, 46));
+        plain.finish();
+        let mut marked = super::MarkPainter::default();
+        marked.fill(rect, 2.0, Color::rgb(38, 40, 46));
+        marked.highlight(rect.shrink(1.0), 1.0, Color::rgba(255, 255, 255, 70));
+        marked.finish();
+        assert_eq!(plain.fingerprint, marked.fingerprint);
+        assert!(plain.overlay.is_none());
+        assert!(marked.overlay.is_some());
     }
 
     #[test]

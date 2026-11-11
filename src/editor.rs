@@ -10,7 +10,7 @@ use crate::features::SliceInfo;
 use crate::params::{SEED_MAX, SEED_MIN, SonomoriParams};
 use crate::sample::{self, IMPORT_EXTENSIONS, SampleData};
 use crate::score::{Lane, Pattern};
-use crate::session::{LoadStatus, METER_ACTIVE, Shared, Snapshot};
+use crate::session::{LoadStatus, Shared, Snapshot};
 use crate::slice::sensitivity_bucket;
 use crate::ui::{Breadth, Color, Painter, Point, Rect, Sense, Surface};
 
@@ -52,6 +52,12 @@ pub struct SonomoriEditor {
     import_tx: Sender<Option<PathBuf>>,
     import_rx: Receiver<Option<PathBuf>>,
     import_open: bool,
+    /// `SONOMORI_LOAD` / `SONOMORI_PLAY` / `SONOMORI_READY`, used by the
+    /// profiling script. Idle unless those variables are set.
+    profile_checked: bool,
+    profile_load_id: u64,
+    profile_play: bool,
+    profile_ready: Option<String>,
 }
 
 impl SonomoriEditor {
@@ -79,6 +85,10 @@ impl SonomoriEditor {
             import_tx,
             import_rx,
             import_open: false,
+            profile_checked: false,
+            profile_load_id: 0,
+            profile_play: false,
+            profile_ready: None,
         }
     }
 
@@ -100,7 +110,14 @@ impl SonomoriEditor {
 
     fn poll_loads(&mut self) {
         while let Ok(finished) = self.load_rx.try_recv() {
+            let profile = finished.id == self.profile_load_id;
+            if profile {
+                self.profile_load_id = 0;
+            }
             if finished.id != self.active_load_id {
+                if profile {
+                    self.write_profile_ready("fail\n");
+                }
                 continue;
             }
             match finished.result {
@@ -108,11 +125,46 @@ impl SonomoriEditor {
                     *self.params.sample_path.lock() = data.path.clone();
                     self.path_input = data.path.clone();
                     self.shared.store_sample(data);
+                    if profile && self.profile_play {
+                        self.shared.audition.store(true, Ordering::Relaxed);
+                    }
+                    if profile {
+                        self.write_profile_ready("ok\n");
+                    }
                 }
                 Err(message) => {
                     self.shared.set_status(LoadStatus::Failed { message });
+                    if profile {
+                        self.write_profile_ready("fail\n");
+                    }
                 }
             }
+        }
+    }
+
+    fn boot_profile(&mut self) {
+        if self.profile_checked {
+            return;
+        }
+        self.profile_checked = true;
+        let Ok(path) = std::env::var("SONOMORI_LOAD") else {
+            return;
+        };
+        if path.is_empty() {
+            return;
+        }
+        self.profile_play = std::env::var_os("SONOMORI_PLAY").is_some();
+        self.profile_ready = std::env::var("SONOMORI_READY")
+            .ok()
+            .filter(|path| !path.is_empty());
+        self.begin_load(PathBuf::from(path));
+        self.profile_load_id = self.active_load_id;
+    }
+
+    fn write_profile_ready(&mut self, body: &str) {
+        self.profile_play = false;
+        if let Some(path) = self.profile_ready.take() {
+            let _ = std::fs::write(path, body);
         }
     }
 
@@ -141,27 +193,164 @@ impl SonomoriEditor {
         }
     }
 
-    pub(crate) fn show(&mut self, ui: &mut impl Surface, setter: &ParamSetter<'_>) {
+    pub(crate) fn prepare(&mut self) {
+        self.boot_profile();
         self.poll_loads();
         self.poll_import();
+    }
+
+    pub(crate) fn path_input(&self) -> &str {
+        &self.path_input
+    }
+
+    /// Inputs of the waveform, transport, and sliders. The playhead is not one
+    /// of them: it moves every step and is drawn on its own.
+    pub(crate) fn chrome_key(&mut self) -> u64 {
+        let mut hash = mix(0xcbf29ce484222325, 1);
+        hash = mix(hash, self.shared.standalone.load(Ordering::Relaxed) as u64);
+        hash = mix(hash, self.shared.audition.load(Ordering::Relaxed) as u64);
+        hash = mix(hash, self.import_open as u64);
+        hash = mix(hash, self.undo_seed.is_some() as u64);
+        hash = mix_str(hash, &self.path_input);
+        hash = mix_float(hash, &self.params.density);
+        hash = mix_float(hash, &self.params.syncopation);
+        hash = mix_float(hash, &self.params.symmetry);
+        hash = mix_float(hash, &self.params.pattern_var);
+        hash = mix_float(hash, &self.params.sound_var);
+        hash = mix_float(hash, &self.params.swing);
+        hash = mix_float(hash, &self.params.decay);
+        hash = mix_float(hash, &self.params.tone);
+        hash = mix_float(hash, &self.params.sensitivity);
+        hash = mix_float(hash, &self.params.tempo);
+        hash = mix_float(hash, &self.params.output);
+        hash = mix_int(hash, &self.params.pitch);
+        hash = mix_int(hash, &self.params.bars);
+        hash = mix_int(hash, &self.params.seed);
+        let loaded = self.shared.sample.load();
+        hash = mix(
+            hash,
+            loaded
+                .as_ref()
+                .map(|data| Arc::as_ptr(data) as u64)
+                .unwrap_or(0),
+        );
+        let snapshot = self.snapshot.read();
+        for lane in snapshot.pattern.lanes {
+            hash = mix(hash, lane.start as u64);
+            hash = mix(hash, lane.end as u64);
+        }
+        hash = mix(hash, snapshot.clock.host_playing as u64);
+        hash = mix(hash, (snapshot.clock.bpm * 10.0).round() as i16 as u64);
+        let status = self.shared.status.lock();
+        mix_status(hash, &status)
+    }
+
+    pub(crate) fn wants_pump(&self) -> bool {
+        self.import_open || matches!(*self.shared.status.lock(), LoadStatus::Loading { .. })
+    }
+
+    /// Egui and rune paint the whole screen through this. The iced editor
+    /// paints the pieces below so a playhead step can skip the waveform.
+    #[cfg_attr(not(any(test, ui_egui, ui_rune)), allow(dead_code))]
+    pub(crate) fn show(&mut self, ui: &mut impl Surface, setter: &ParamSetter<'_>) {
+        self.prepare();
+        self.paint_top(ui, setter);
+        self.paint_grid(ui);
+        self.paint_sliders(ui, setter);
+        self.paint_readout(ui);
+        if self.wants_pump() {
+            ui.request_repaint();
+        }
+    }
+
+    pub(crate) fn paint_top(&mut self, ui: &mut impl Surface, setter: &ParamSetter<'_>) {
         let sample = self.shared.sample.load_full();
         let snapshot = *self.snapshot.read();
         let mut queued_load = None;
         let mut request_import = false;
-        draw(
-            ui,
-            setter,
-            &self.params,
-            &self.shared,
-            &mut self.preview_tx,
-            &mut self.path_input,
-            &mut self.undo_seed,
-            &sample,
-            &snapshot,
-            &mut queued_load,
-            self.import_open,
-            &mut request_import,
-        );
+        let bucket = sensitivity_bucket(self.params.sensitivity.value());
+        let slices = sample
+            .as_ref()
+            .and_then(|loaded| loaded.buckets.get(bucket))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+
+        ui.heading(crate::Sonomori::NAME);
+        ui.label("Import a sound, chop it on transients, and play a generated loop.");
+        ui.space(4.0);
+
+        ui.row(|ui| {
+            if ui.button("Import", !self.import_open) {
+                request_import = true;
+            }
+            if ui.button("Randomize", true) {
+                randomize(setter, &self.params, &mut self.undo_seed);
+            }
+            if ui.button("Undo", self.undo_seed.is_some())
+                && let Some(seed) = self.undo_seed.take()
+            {
+                set_int(setter, &self.params.seed, seed);
+            }
+            ui.label(&format!("Seed {}", self.params.seed.value()));
+        });
+
+        ui.row(|ui| {
+            let standalone = self.shared.standalone.load(Ordering::Relaxed);
+            let audition = self.shared.audition.load(Ordering::Relaxed);
+            let label = if audition {
+                "Stop"
+            } else if standalone {
+                "Play"
+            } else {
+                "Audition"
+            };
+            if ui.button(label, true) {
+                self.shared.audition.store(!audition, Ordering::Relaxed);
+            }
+            if snapshot.clock.host_playing {
+                ui.label(&format!("Host is playing at {:.1} BPM", snapshot.clock.bpm));
+            } else if audition {
+                ui.label(&format!(
+                    "{} at {:.1} BPM",
+                    if standalone { "Playing" } else { "Audition" },
+                    snapshot.clock.bpm
+                ));
+            } else if standalone {
+                ui.label("Press Play to start the loop.");
+            } else {
+                ui.label("Press play in the DAW, or Audition while it is stopped.");
+            }
+        });
+
+        ui.row(|ui| {
+            ui.text_field(&mut self.path_input, "or paste a file path", 360.0);
+            if ui.button("Load path", true) {
+                let path = PathBuf::from(self.path_input.trim());
+                if !path.as_os_str().is_empty() {
+                    queued_load = Some(path);
+                }
+            }
+        });
+
+        ui.label(&status_line(&self.shared, sample.as_deref(), slices.len()));
+
+        if let Some(loaded) = sample.as_ref() {
+            paint_waveform(ui, loaded, slices, &snapshot, &mut self.preview_tx);
+        } else {
+            ui.canvas(Breadth::Fill, 110.0, Sense::Hover, |rect, painter, _| {
+                painter.fill(rect, 4.0, Color::rgb(22, 24, 28));
+                painter.text_centered(
+                    rect.center(),
+                    "No sound loaded",
+                    14.0,
+                    Color::rgb(140, 144, 150),
+                );
+            });
+        }
+
+        ui.space(6.0);
+        ui.label("Pattern");
+
         if let Some(path) = queued_load {
             self.begin_load(path);
         }
@@ -173,6 +362,53 @@ impl SonomoriEditor {
             // queued, and a later frame reads the chosen path.
             self.poll_import();
         }
+    }
+
+    pub(crate) fn paint_grid(&mut self, ui: &mut impl Surface) {
+        let snapshot = *self.snapshot.read();
+        paint_pattern(ui, &snapshot);
+    }
+
+    pub(crate) fn paint_sliders(&mut self, ui: &mut impl Surface, setter: &ParamSetter<'_>) {
+        ui.space(8.0);
+        let params = &self.params;
+        ui.split_two(|left, right| {
+            left.param_slider("Density", &params.density, setter);
+            left.param_slider("Syncopation", &params.syncopation, setter);
+            left.param_slider("Symmetry", &params.symmetry, setter);
+            left.param_slider("Pattern variation", &params.pattern_var, setter);
+            left.param_slider("Swing", &params.swing, setter);
+            left.param_slider("Bars", &params.bars, setter);
+
+            right.param_slider("Sound variation", &params.sound_var, setter);
+            right.param_slider("Decay", &params.decay, setter);
+            right.param_slider("Pitch", &params.pitch, setter);
+            right.param_slider("Tone", &params.tone, setter);
+            right.param_slider("Slice sensitivity", &params.sensitivity, setter);
+            let tempo_label = if self.shared.standalone.load(Ordering::Relaxed) {
+                "Tempo"
+            } else {
+                "Audition tempo"
+            };
+            right.param_slider(tempo_label, &params.tempo, setter);
+            right.param_slider("Output", &params.output, setter);
+        });
+    }
+
+    pub(crate) fn paint_readout(&mut self, ui: &mut impl Surface) {
+        ui.space(6.0);
+        let meter = self.shared.meter.load(Ordering::Relaxed);
+        let db = if meter > 1.0e-8 {
+            20.0 * meter.log10()
+        } else {
+            -80.0
+        };
+        let normalized = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+        ui.progress(normalized, &format!("{db:.1} dB"));
+        ui.hint(
+            "Click a slice to preview it. Randomize picks new slices and a new groove. The macros reshape that groove.",
+            12.0,
+        );
     }
 }
 
@@ -195,147 +431,36 @@ fn open_import_dialog(tx: Sender<Option<PathBuf>>) {
     show();
 }
 
-fn draw(
-    ui: &mut impl Surface,
-    setter: &ParamSetter<'_>,
-    params: &SonomoriParams,
-    shared: &Shared,
-    preview_tx: &mut rtrb::Producer<u32>,
-    path_input: &mut String,
-    undo_seed: &mut Option<i32>,
-    sample: &Option<Arc<SampleData>>,
-    snapshot: &Snapshot,
-    queued_load: &mut Option<PathBuf>,
-    import_open: bool,
-    request_import: &mut bool,
-) {
-    let bucket = sensitivity_bucket(params.sensitivity.value());
-    let slices = sample
-        .as_ref()
-        .and_then(|loaded| loaded.buckets.get(bucket))
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
+fn mix(hash: u64, value: u64) -> u64 {
+    (hash ^ value).wrapping_mul(0x100000001b3)
+}
 
-    ui.heading(crate::Sonomori::NAME);
-    ui.label("Import a sound, chop it on transients, and play a generated loop.");
-    ui.space(4.0);
+fn mix_f32(hash: u64, value: f32) -> u64 {
+    mix(hash, value.to_bits() as u64)
+}
 
-    ui.row(|ui| {
-        if ui.button("Import", !import_open) {
-            *request_import = true;
-        }
-        if ui.button("Randomize", true) {
-            randomize(setter, params, undo_seed);
-        }
-        if ui.button("Undo", undo_seed.is_some())
-            && let Some(seed) = undo_seed.take()
-        {
-            set_int(setter, &params.seed, seed);
-        }
-        ui.label(&format!("Seed {}", params.seed.value()));
-    });
-
-    ui.row(|ui| {
-        let standalone = shared.standalone.load(Ordering::Relaxed);
-        let audition = shared.audition.load(Ordering::Relaxed);
-        let label = if audition {
-            "Stop"
-        } else if standalone {
-            "Play"
-        } else {
-            "Audition"
-        };
-        if ui.button(label, true) {
-            shared.audition.store(!audition, Ordering::Relaxed);
-        }
-        if snapshot.clock.host_playing {
-            ui.label(&format!("Host is playing at {:.1} BPM", snapshot.clock.bpm));
-        } else if audition {
-            ui.label(&format!(
-                "{} at {:.1} BPM",
-                if standalone { "Playing" } else { "Audition" },
-                snapshot.clock.bpm
-            ));
-        } else if standalone {
-            ui.label("Press Play to start the loop.");
-        } else {
-            ui.label("Press play in the DAW, or Audition while it is stopped.");
-        }
-    });
-
-    ui.row(|ui| {
-        ui.text_field(path_input, "or paste a file path", 360.0);
-        if ui.button("Load path", true) {
-            let path = PathBuf::from(path_input.trim());
-            if !path.as_os_str().is_empty() {
-                *queued_load = Some(path);
-            }
-        }
-    });
-
-    ui.label(&status_line(shared, sample.as_deref(), slices.len()));
-
-    if let Some(loaded) = sample.as_ref() {
-        paint_waveform(ui, loaded, slices, snapshot, preview_tx);
-    } else {
-        ui.canvas(Breadth::Fill, 110.0, Sense::Hover, |rect, painter, _| {
-            painter.fill(rect, 4.0, Color::rgb(22, 24, 28));
-            painter.text_centered(
-                rect.center(),
-                "No sound loaded",
-                14.0,
-                Color::rgb(140, 144, 150),
-            );
-        });
+fn mix_str(mut hash: u64, text: &str) -> u64 {
+    for byte in text.bytes() {
+        hash = mix(hash, byte as u64);
     }
+    hash
+}
 
-    ui.space(6.0);
-    ui.label("Pattern");
-    paint_pattern(ui, snapshot);
+fn mix_float(hash: u64, param: &nice_plug::prelude::FloatParam) -> u64 {
+    let hash = mix_f32(hash, param.value());
+    mix_f32(hash, param.modulated_normalized_value())
+}
 
-    ui.space(8.0);
-    ui.split_two(|left, right| {
-        left.param_slider("Density", &params.density, setter);
-        left.param_slider("Syncopation", &params.syncopation, setter);
-        left.param_slider("Symmetry", &params.symmetry, setter);
-        left.param_slider("Pattern variation", &params.pattern_var, setter);
-        left.param_slider("Swing", &params.swing, setter);
-        left.param_slider("Bars", &params.bars, setter);
+fn mix_int(hash: u64, param: &nice_plug::prelude::IntParam) -> u64 {
+    let hash = mix(hash, param.value() as u32 as u64);
+    mix_f32(hash, param.modulated_normalized_value())
+}
 
-        right.param_slider("Sound variation", &params.sound_var, setter);
-        right.param_slider("Decay", &params.decay, setter);
-        right.param_slider("Pitch", &params.pitch, setter);
-        right.param_slider("Tone", &params.tone, setter);
-        right.param_slider("Slice sensitivity", &params.sensitivity, setter);
-        let tempo_label = if shared.standalone.load(Ordering::Relaxed) {
-            "Tempo"
-        } else {
-            "Audition tempo"
-        };
-        right.param_slider(tempo_label, &params.tempo, setter);
-        right.param_slider("Output", &params.output, setter);
-    });
-
-    ui.space(6.0);
-    let meter = shared.meter.load(Ordering::Relaxed);
-    let db = if meter > 1.0e-8 {
-        20.0 * meter.log10()
-    } else {
-        -80.0
-    };
-    let normalized = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
-    ui.progress(normalized, &format!("{db:.1} dB"));
-    ui.hint(
-        "Click a slice to preview it. Randomize picks new slices and a new groove. The macros reshape that groove.",
-        12.0,
-    );
-
-    if snapshot.playing
-        || meter > METER_ACTIVE
-        || import_open
-        || matches!(*shared.status.lock(), LoadStatus::Loading { .. })
-    {
-        ui.request_repaint();
+fn mix_status(hash: u64, status: &LoadStatus) -> u64 {
+    match status {
+        LoadStatus::Idle => mix(hash, 1),
+        LoadStatus::Loading { name } => mix_str(mix(hash, 2), name),
+        LoadStatus::Failed { message } => mix_str(mix(hash, 3), message),
     }
 }
 
@@ -514,9 +639,56 @@ fn paint_pattern(ui: &mut impl Surface, snapshot: &Snapshot) {
                 };
                 painter.fill(cell_rect, 2.0, color);
                 if snapshot.playhead == Some(step) {
-                    painter.fill(cell_rect.shrink(1.0), 1.0, Color::rgba(255, 255, 255, 70));
+                    painter.highlight(cell_rect.shrink(1.0), 1.0, Color::rgba(255, 255, 255, 70));
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use nice_plug::params::InternalParamMut;
+
+    use crate::params::SonomoriParams;
+    use crate::session::{Shared, Snapshot};
+
+    use super::SonomoriEditor;
+
+    #[test]
+    fn chrome_key_ignores_the_playhead() {
+        let params = Arc::new(SonomoriParams::default());
+        let (mut input, output) = triple_buffer::triple_buffer(&Snapshot::default());
+        let (preview_tx, _rx) = rtrb::RingBuffer::new(4);
+        let mut editor = SonomoriEditor::new(params, Shared::new(), preview_tx, output);
+        let first = editor.chrome_key();
+
+        let mut moved = Snapshot::default();
+        moved.playhead = Some(7);
+        input.write(moved);
+        assert_eq!(editor.chrome_key(), first);
+
+        let mut retimed = Snapshot::default();
+        retimed.clock.bpm = 99.0;
+        input.write(retimed);
+        assert_ne!(editor.chrome_key(), first);
+    }
+
+    #[test]
+    fn chrome_key_tracks_a_slider() {
+        let params = Arc::new(SonomoriParams::default());
+        let (_input, output) = triple_buffer::triple_buffer(&Snapshot::default());
+        let (preview_tx, _rx) = rtrb::RingBuffer::new(4);
+        let mut editor = SonomoriEditor::new(params, Shared::new(), preview_tx, output);
+        let first = editor.chrome_key();
+        unsafe {
+            editor
+                .params
+                .tempo
+                ._internal_set_plain_value(editor.params.tempo.value() + 10.0);
+        }
+        assert_ne!(editor.chrome_key(), first);
     }
 }

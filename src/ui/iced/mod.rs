@@ -1,9 +1,9 @@
 //! The iced editor.
 //!
 //! wgpu only: the software renderer redraws the whole window on macOS and
-//! spikes the CPU while the playhead moves. The poll matches the audio
-//! thread's 30 ms repaint, and the window is not redrawn unless that flag
-//! is set.
+//! spikes the CPU while the playhead moves. The window is not redrawn unless
+//! the audio thread (or a gesture) sets the flag. The poll is only how long
+//! that flag can wait before the editor paints.
 
 mod face;
 
@@ -21,7 +21,7 @@ use crate::editor::SonomoriEditor;
 
 use face::{Screen, window_style};
 
-/// Same period the audio thread waits between repaint requests.
+/// Longest a playhead step waits before the editor paints it.
 const POLL: Duration = Duration::from_millis(30);
 
 pub type EditorState = IcedEditorState;

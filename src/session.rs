@@ -171,7 +171,6 @@ impl BeatCursor {
 pub struct Snapshot {
     pub pattern: Pattern,
     pub playhead: Option<usize>,
-    pub playing: bool,
     pub clock: Clock,
 }
 
@@ -180,7 +179,6 @@ impl Default for Snapshot {
         Self {
             pattern: Pattern::default(),
             playhead: None,
-            playing: false,
             clock: Clock {
                 host_playing: false,
                 bpm: 120.0,

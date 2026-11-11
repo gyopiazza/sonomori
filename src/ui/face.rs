@@ -127,6 +127,12 @@ pub trait Painter {
     fn fill(&mut self, rect: Rect, radius: f32, color: Color);
     fn line(&mut self, from: Point, to: Point, width: f32, color: Color);
     fn text_centered(&mut self, at: Point, text: &str, size: f32, color: Color);
+
+    /// Playhead mark. It moves every step. The default paints it with `fill`.
+    /// A backend can keep it out of a cached mesh so the cells under it stay put.
+    fn highlight(&mut self, rect: Rect, radius: f32, color: Color) {
+        self.fill(rect, radius, color);
+    }
 }
 
 /// What the editor can draw. A UI library implements this once.

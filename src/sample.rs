@@ -182,8 +182,14 @@ impl SampleData {
         trimmed: bool,
     ) -> Self {
         let frames = left.len().min(right.len());
-        let left = left[..frames].to_vec();
-        let right = right[..frames].to_vec();
+        let mut left = left;
+        let mut right = right;
+        left.truncate(frames);
+        right.truncate(frames);
+        // Decode grows these by doubling. Drop the spare capacity before the
+        // buffers are parked for the session.
+        left.shrink_to_fit();
+        right.shrink_to_fit();
         let seconds = frames as f32 / sample_rate.max(1.0);
 
         let mut mono = Vec::with_capacity(frames);

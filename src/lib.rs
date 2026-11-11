@@ -21,7 +21,9 @@ use engine::{Audio, Engine, FrameInput, Preview, step_at};
 use params::{SonomoriParams, gen_params};
 use pattern::{GenParams, cache_key};
 use score::{MAX_STEPS, Pattern};
-use session::{BeatCursor, Clock, LoadStatus, METER_ACTIVE, Shared, Snapshot, beats_from_samples};
+use session::{
+    BeatCursor, Clock, LoadStatus, METER_ACTIVE, Shared, Snapshot, beats_from_samples,
+};
 use slice::sensitivity_bucket;
 
 pub(crate) const WINDOW_SIZE: nice_plug::editor::dpi::LogicalSize<f32> =
@@ -29,10 +31,12 @@ pub(crate) const WINDOW_SIZE: nice_plug::editor::dpi::LogicalSize<f32> =
 pub(crate) const MIN_WINDOW_SIZE: nice_plug::editor::dpi::LogicalSize<f32> =
     nice_plug::editor::dpi::LogicalSize::new(760.0, 960.0);
 const DEFAULT_SAMPLE_RATE: f32 = 44_100.0;
-const REPAINT_SECONDS: f32 = 0.03;
+/// How often a stopped, decaying meter may wake the editor. While the
+/// transport is running the editor wakes on the playhead step instead.
+const METER_SECONDS: f32 = 0.10;
 
-fn repaint_every(sample_rate: f32) -> usize {
-    ((sample_rate * REPAINT_SECONDS) as usize).max(1)
+fn samples_for(sample_rate: f32, seconds: f32) -> usize {
+    ((sample_rate * seconds) as usize).max(1)
 }
 const RESIZE_HINT: ResizeHint = ResizeHint::resizable().with_min_logical_size(MIN_WINDOW_SIZE);
 
@@ -50,7 +54,11 @@ pub struct Sonomori {
     sample_rate: f32,
     beats: BeatCursor,
     attempted_path: String,
-    repaint_interval: usize,
+    /// Bumps when the pattern is rebuilt, so the editor can wake without a
+    /// byte-wise compare of the score on the audio thread.
+    pattern_serial: u64,
+    ui_view: UiView,
+    meter_interval: usize,
     repaint_accum: usize,
 }
 
@@ -76,7 +84,9 @@ impl Default for Sonomori {
             sample_rate: DEFAULT_SAMPLE_RATE,
             beats: BeatCursor::default(),
             attempted_path: String::new(),
-            repaint_interval: repaint_every(DEFAULT_SAMPLE_RATE),
+            pattern_serial: 0,
+            ui_view: UiView::default(),
+            meter_interval: samples_for(DEFAULT_SAMPLE_RATE, METER_SECONDS),
             repaint_accum: 0,
         }
     }
@@ -160,7 +170,7 @@ impl Plugin for Sonomori {
             context.plugin_api() == PluginApi::Standalone,
             Ordering::Relaxed,
         );
-        self.repaint_interval = repaint_every(buffer_config.sample_rate);
+        self.meter_interval = samples_for(buffer_config.sample_rate, METER_SECONDS);
         self.maybe_load_persisted();
         true
     }
@@ -198,6 +208,7 @@ impl Plugin for Sonomori {
                 .unwrap_or(&[]);
             self.pattern = pattern::generate(slices, &settings);
             self.pattern_key = Some(key);
+            self.pattern_serial = self.pattern_serial.wrapping_add(1);
         }
 
         let transport = context.transport();
@@ -286,19 +297,35 @@ impl Plugin for Sonomori {
         } else {
             None
         };
-        self.snapshot_tx.write(Snapshot {
-            pattern: self.pattern,
-            playhead,
-            playing,
-            clock,
-        });
-
-        if ui::is_open(&self.editor_state) && (playing || next_meter > METER_ACTIVE) {
-            self.repaint_accum += frames;
-            if self.repaint_accum >= self.repaint_interval {
+        let next_view = UiView {
+            step: playhead,
+            host_playing: clock.host_playing,
+            audition,
+            standalone,
+            bpm_tenth: (f32::from(clock.bpm) * 10.0).round() as i16,
+            pattern: self.pattern_serial,
+            meter: meter_bucket(next_meter),
+        };
+        // The picture only changes when the step, transport, pattern, or a
+        // stopped meter moves. Copying the score into the snapshot and waking
+        // the window on every block redraws an unchanged editor.
+        match ui_wake(self.ui_view, next_view, self.repaint_accum, self.meter_interval) {
+            UiWake::Now => {
+                if self.ui_view.musical_ne(next_view) {
+                    self.snapshot_tx.write(Snapshot {
+                        pattern: self.pattern,
+                        playhead,
+                        clock,
+                    });
+                }
+                self.ui_view = next_view;
                 self.repaint_accum = 0;
-                ui::request_repaint(&self.repaint_notifier);
+                if ui::is_open(&self.editor_state) {
+                    ui::request_repaint(&self.repaint_notifier);
+                }
             }
+            UiWake::Wait => self.repaint_accum += frames,
+            UiWake::Idle => self.repaint_accum = 0,
         }
 
         if playing || self.engine.any_active() {
@@ -332,5 +359,141 @@ impl Vst3Plugin for Sonomori {
     ];
 }
 
+/// What the open editor is currently showing. Compared on the audio thread
+/// so a steady loop does not wake the window on every block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UiView {
+    step: Option<usize>,
+    host_playing: bool,
+    audition: bool,
+    standalone: bool,
+    bpm_tenth: i16,
+    pattern: u64,
+    meter: u16,
+}
+
+impl Default for UiView {
+    fn default() -> Self {
+        Self {
+            step: None,
+            host_playing: false,
+            audition: false,
+            standalone: false,
+            bpm_tenth: 0,
+            pattern: 0,
+            meter: 0,
+        }
+    }
+}
+
+impl UiView {
+    fn playing(self) -> bool {
+        self.host_playing || self.audition
+    }
+
+    fn musical_ne(self, other: Self) -> bool {
+        self.step != other.step
+            || self.host_playing != other.host_playing
+            || self.audition != other.audition
+            || self.standalone != other.standalone
+            || self.bpm_tenth != other.bpm_tenth
+            || self.pattern != other.pattern
+    }
+}
+
+enum UiWake {
+    Now,
+    Wait,
+    Idle,
+}
+
+fn meter_bucket(meter: f32) -> u16 {
+    if meter < METER_ACTIVE {
+        return 0;
+    }
+    (meter.clamp(0.0, 1.0) * 32.0) as u16
+}
+
+fn ui_wake(previous: UiView, next: UiView, elapsed: usize, meter_interval: usize) -> UiWake {
+    if previous.musical_ne(next) {
+        return UiWake::Now;
+    }
+    // A running loop samples the meter on the next step. A stopped meter
+    // still falls, but only as fast as the bucket interval.
+    if previous.meter != next.meter && !next.playing() {
+        if elapsed >= meter_interval {
+            UiWake::Now
+        } else {
+            UiWake::Wait
+        }
+    } else {
+        UiWake::Idle
+    }
+}
+
 nice_export_clap!(Sonomori);
 nice_export_vst3!(Sonomori);
+
+#[cfg(test)]
+mod ui_wake_tests {
+    use super::*;
+
+    fn view() -> UiView {
+        UiView {
+            step: None,
+            host_playing: false,
+            audition: false,
+            standalone: true,
+            bpm_tenth: 1200,
+            pattern: 1,
+            meter: 0,
+        }
+    }
+
+    #[test]
+    fn a_step_change_wakes_immediately() {
+        let mut previous = view();
+        previous.audition = true;
+        previous.step = Some(0);
+        let mut next = previous;
+        next.step = Some(1);
+        next.meter = 20;
+        assert!(matches!(
+            ui_wake(previous, next, 0, 1_000),
+            UiWake::Now
+        ));
+    }
+
+    #[test]
+    fn meter_motion_while_playing_does_not_wake() {
+        let mut previous = view();
+        previous.audition = true;
+        previous.step = Some(3);
+        previous.meter = 10;
+        let mut next = previous;
+        next.meter = 4;
+        assert!(matches!(
+            ui_wake(previous, next, 10_000, 100),
+            UiWake::Idle
+        ));
+    }
+
+    #[test]
+    fn a_falling_meter_waits_out_the_interval() {
+        let previous = view();
+        let mut next = previous;
+        next.meter = 8;
+        assert!(matches!(ui_wake(previous, next, 10, 1_000), UiWake::Wait));
+        assert!(matches!(
+            ui_wake(previous, next, 1_000, 1_000),
+            UiWake::Now
+        ));
+    }
+
+    #[test]
+    fn silence_and_full_scale_land_in_distinct_buckets() {
+        assert_eq!(meter_bucket(0.0), 0);
+        assert!(meter_bucket(1.0) > meter_bucket(0.1));
+        assert_eq!(meter_bucket(4.0), meter_bucket(1.0));
+    }
+}

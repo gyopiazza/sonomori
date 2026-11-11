@@ -20,9 +20,11 @@ nice-plug-egui = "0.6.0"
 # spikes the CPU while the playhead is moving. Canvas is the waveform path.
 # The thread pool is the executor the poll subscription needs. Fira Sans is
 # the embedded UI face.
+# `lazy` keeps the waveform and sliders from rebuilding on every playhead step.
 nice-plug-iced = { version = "0.5.0", default-features = false, features = [
     "canvas",
     "fira-sans",
+    "lazy",
     "thread-pool",
     "wgpu",
 ] }
@@ -66,3 +68,10 @@ opt-level = 1
 codegen-units = 1
 lto = "thin"
 strip = "symbols"
+
+# Same optimizer as release, with line tables left in so `sample` can
+# attribute the profiling run. `scripts/profile-iced.sh` builds this.
+[profile.profiling]
+inherits = "release"
+strip = "none"
+debug = "line-tables-only"
