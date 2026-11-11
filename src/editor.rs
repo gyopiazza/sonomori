@@ -94,6 +94,10 @@ impl SonomoriEditor {
         self.gui.clone()
     }
 
+    pub(crate) fn params(&self) -> &Arc<SonomoriParams> {
+        &self.params
+    }
+
     fn poll_loads(&mut self) {
         while let Ok(finished) = self.load_rx.try_recv() {
             if finished.id != self.active_load_id {

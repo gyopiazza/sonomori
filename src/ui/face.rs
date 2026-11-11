@@ -148,12 +148,12 @@ pub trait Surface: Sized {
     fn text_field(&mut self, text: &mut String, hint: &str, width: f32);
     fn param_slider<P: Param>(&mut self, label: &str, param: &P, setter: &ParamSetter<'_>);
     fn progress(&mut self, fraction: f32, text: &str);
-    fn canvas<R>(
-        &mut self,
+    fn canvas<'a, R>(
+        &'a mut self,
         breadth: Breadth,
         height: f32,
         sense: Sense,
-        draw: impl FnOnce(Rect, &mut Self::Painter<'_>, Option<Point>) -> R,
+        draw: impl FnOnce(Rect, &mut Self::Painter<'a>, Option<Point>) -> R,
     ) -> R;
     fn request_repaint(&mut self);
 }

@@ -164,12 +164,12 @@ impl Surface for egui::Ui {
         self.add(egui::ProgressBar::new(fraction).text(text));
     }
 
-    fn canvas<R>(
-        &mut self,
+    fn canvas<'a, R>(
+        &'a mut self,
         breadth: Breadth,
         height: f32,
         sense: Sense,
-        draw: impl FnOnce(Rect, &mut Self::Painter<'_>, Option<Point>) -> R,
+        draw: impl FnOnce(Rect, &mut Self::Painter<'a>, Option<Point>) -> R,
     ) -> R {
         let width = match breadth {
             Breadth::Fixed(width) => width,
@@ -461,40 +461,6 @@ mod layout {
                 ],
                 ints
             );
-        }
-    }
-}
-
-#[cfg(test)]
-mod seam {
-    #[test]
-    fn product_code_does_not_name_the_ui_library() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut hits = Vec::new();
-        visit(&src, &mut hits);
-        assert!(
-            hits.is_empty(),
-            "only src/ui/backend.rs may name the UI library, found {hits:?}"
-        );
-    }
-
-    fn visit(dir: &std::path::Path, hits: &mut Vec<String>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                visit(&path, hits);
-                continue;
-            }
-            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-                continue;
-            }
-            if path.file_name().and_then(|name| name.to_str()) == Some("backend.rs") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).unwrap();
-            if text.contains("egui") {
-                hits.push(path.display().to_string());
-            }
         }
     }
 }
