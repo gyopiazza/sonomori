@@ -12,4 +12,4 @@ pub(crate) enum Ui {
 }
 
 #[allow(dead_code)]
-pub const BACKEND: Ui = Ui::Rune;
+pub const BACKEND: Ui = Ui::Egui;
