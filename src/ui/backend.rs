@@ -75,6 +75,22 @@ impl NiceEguiApp for SonomoriEditor {
     }
 }
 
+/// Widest readout the parameters can show. Measured, not the current value,
+/// so the track beside it does not resize while dragging.
+fn readout_width(ui: &egui::Ui) -> f32 {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let widest = ["-24.0 dB", "240 BPM", "-12 st", "-100", "+100", "100%"]
+        .into_iter()
+        .map(|text| {
+            ui.painter()
+                .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        })
+        .fold(0.0_f32, f32::max);
+    widest.ceil() + 1.0
+}
+
 fn install_skin(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
     ctx.style_mut_of(egui::Theme::Dark, |style| {
@@ -128,7 +144,20 @@ impl Surface for egui::Ui {
 
     fn param_slider<P: Param>(&mut self, label: &str, param: &P, setter: &ParamSetter<'_>) {
         self.label(label);
-        self.add(widgets::ParamSlider::for_param(param, setter).with_width(self.available_width()));
+        let gap = self.spacing().item_spacing.x;
+        let value_width = readout_width(self);
+        let slider_width = (self.available_width() - value_width - gap).max(1.0);
+        self.horizontal(|ui| {
+            ui.add(
+                widgets::ParamSlider::for_param(param, setter)
+                    .without_value()
+                    .with_width(slider_width),
+            );
+            ui.add_sized(
+                egui::vec2(value_width, ui.spacing().interact_size.y),
+                egui::Label::new(param.to_string()).halign(egui::Align::Max),
+            );
+        });
     }
 
     fn progress(&mut self, fraction: f32, text: &str) {
@@ -217,6 +246,223 @@ fn rect_from_egui(rect: egui::Rect) -> Rect {
             y: rect.max.y,
         },
     )
+}
+
+#[cfg(test)]
+mod layout {
+    use std::sync::Arc;
+
+    use nice_plug::params::InternalParamMut;
+    use nice_plug::prelude::{GuiContextInner, ParamPtr, ParamSetter, PluginApi, PluginState};
+
+    use crate::editor::SonomoriEditor;
+    use crate::params::SonomoriParams;
+    use crate::session::{Shared, Snapshot};
+
+    struct DummyGui;
+
+    impl GuiContextInner for DummyGui {
+        fn plugin_api(&self) -> PluginApi {
+            PluginApi::Standalone
+        }
+        unsafe fn raw_begin_set_parameter(&self, _: ParamPtr) {}
+        unsafe fn raw_set_parameter_normalized(&self, _: ParamPtr, _: f32) {}
+        unsafe fn raw_end_set_parameter(&self, _: ParamPtr) {}
+        fn get_state(&self) -> PluginState {
+            PluginState {
+                version: String::new(),
+                params: Default::default(),
+                fields: Default::default(),
+            }
+        }
+        fn set_state(&self, _: PluginState) {}
+        fn request_restart(&self) {}
+    }
+
+    struct Frame {
+        content: egui::Rect,
+        tracks: Vec<egui::Rect>,
+        pills: usize,
+    }
+
+    fn frame(
+        width: f32,
+        height: f32,
+        editor: &mut SonomoriEditor,
+        setter: &ParamSetter<'_>,
+    ) -> Frame {
+        let ctx = egui::Context::default();
+        super::install_skin(&ctx);
+        let mut content = egui::Rect::NOTHING;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, height),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                editor.show(ui, setter);
+                content = ui.min_rect();
+            },
+        );
+
+        let mut tracks: Vec<egui::Rect> = Vec::new();
+        let mut pills = 0;
+        for clipped in &output.shapes {
+            let egui::epaint::Shape::Rect(shape) = &clipped.shape else {
+                continue;
+            };
+            let rect = shape.rect;
+            let radius = shape.corner_radius.nw.max(shape.corner_radius.ne);
+            if radius == 0 && rect.height() > 8.0 && rect.height() < 18.0 && rect.width() > 80.0 {
+                if let Some(existing) = tracks.iter_mut().find(|track| {
+                    (track.top() - rect.top()).abs() < 0.5
+                        && (track.left() - rect.left()).abs() < 0.5
+                }) {
+                    if rect.width() > existing.width() {
+                        *existing = rect;
+                    }
+                } else {
+                    tracks.push(rect);
+                }
+            }
+        }
+        tracks.sort_by(|a, b| {
+            a.top()
+                .total_cmp(&b.top())
+                .then(a.left().total_cmp(&b.left()))
+        });
+        for clipped in &output.shapes {
+            let egui::epaint::Shape::Rect(shape) = &clipped.shape else {
+                continue;
+            };
+            let radius = shape.corner_radius.nw.max(shape.corner_radius.ne);
+            if radius < 4 || shape.rect.height() > 24.0 {
+                continue;
+            }
+            let center = shape.rect.center();
+            if tracks.iter().any(|track| {
+                center.y >= track.top() - 6.0
+                    && center.y <= track.bottom() + 6.0
+                    && center.x >= track.left()
+                    && center.x <= track.right()
+            }) {
+                pills += 1;
+            }
+        }
+        output.textures_delta.clear();
+        Frame {
+            content,
+            tracks,
+            pills,
+        }
+    }
+
+    fn editor() -> (SonomoriEditor, DummyGui, Arc<SonomoriParams>) {
+        let params = Arc::new(SonomoriParams::default());
+        let shared = Shared::new();
+        let (preview_tx, _rx) = rtrb::RingBuffer::new(8);
+        let (_snap_in, snapshot) = triple_buffer::triple_buffer(&Snapshot::default());
+        let editor = SonomoriEditor::new(params.clone(), shared, preview_tx, snapshot);
+        (editor, DummyGui, params)
+    }
+
+    #[test]
+    fn editor_fits_and_sliders_do_not_move_each_other() {
+        let (mut editor, gui, params) = editor();
+        let setter = ParamSetter::new(&gui);
+
+        for size in [crate::WINDOW_SIZE, crate::MIN_WINDOW_SIZE] {
+            let frame = frame(size.width, size.height, &mut editor, &setter);
+            assert!(
+                frame.content.width() <= size.width + 0.5,
+                "content is {:.1} wide in a {} window",
+                frame.content.width(),
+                size.width
+            );
+            assert!(
+                frame.content.height() <= size.height + 0.5,
+                "content is {:.1} tall in a {} window",
+                frame.content.height(),
+                size.height
+            );
+            assert_eq!(frame.pills, 0, "value readouts still draw over the tracks");
+            assert!(
+                frame.tracks.len() >= 13,
+                "expected one track per parameter, found {}",
+                frame.tracks.len()
+            );
+        }
+
+        let baseline = frame(
+            crate::WINDOW_SIZE.width,
+            crate::WINDOW_SIZE.height,
+            &mut editor,
+            &setter,
+        );
+        let floats = [
+            params.symmetry.value(),
+            params.pattern_var.value(),
+            params.swing.value(),
+            params.decay.value(),
+            params.tone.value(),
+            params.sensitivity.value(),
+            params.tempo.value(),
+            params.output.value(),
+        ];
+        let ints = [
+            params.pitch.value(),
+            params.bars.value(),
+            params.seed.value(),
+        ];
+        for (density, sound, sync) in [
+            (1.0, 1.0, 0.0),
+            (1.0, 0.25, -0.04),
+            (0.62, 0.25, 0.5),
+            (0.09, 1.0, 1.0),
+            (0.62, 0.25, -1.0),
+        ] {
+            unsafe {
+                params.density._internal_set_plain_value(density);
+                params.sound_var._internal_set_plain_value(sound);
+                params.syncopation._internal_set_plain_value(sync);
+            }
+            let next = frame(
+                crate::WINDOW_SIZE.width,
+                crate::WINDOW_SIZE.height,
+                &mut editor,
+                &setter,
+            );
+            assert_eq!(
+                next.tracks, baseline.tracks,
+                "moving density={density} sound={sound} sync={sync} moved other tracks"
+            );
+            assert_eq!(
+                [
+                    params.symmetry.value(),
+                    params.pattern_var.value(),
+                    params.swing.value(),
+                    params.decay.value(),
+                    params.tone.value(),
+                    params.sensitivity.value(),
+                    params.tempo.value(),
+                    params.output.value(),
+                ],
+                floats,
+                "moving one parameter wrote another"
+            );
+            assert_eq!(
+                [
+                    params.pitch.value(),
+                    params.bars.value(),
+                    params.seed.value()
+                ],
+                ints
+            );
+        }
+    }
 }
 
 #[cfg(test)]

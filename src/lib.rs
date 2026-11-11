@@ -24,16 +24,17 @@ use score::{MAX_STEPS, Pattern};
 use session::{BeatCursor, Clock, LoadStatus, METER_ACTIVE, Shared, Snapshot, beats_from_samples};
 use slice::sensitivity_bucket;
 
-const WINDOW_SIZE: nice_plug::editor::dpi::LogicalSize<f32> =
-    nice_plug::editor::dpi::LogicalSize::new(960.0, 740.0);
+pub(crate) const WINDOW_SIZE: nice_plug::editor::dpi::LogicalSize<f32> =
+    nice_plug::editor::dpi::LogicalSize::new(960.0, 960.0);
+pub(crate) const MIN_WINDOW_SIZE: nice_plug::editor::dpi::LogicalSize<f32> =
+    nice_plug::editor::dpi::LogicalSize::new(760.0, 960.0);
 const DEFAULT_SAMPLE_RATE: f32 = 44_100.0;
 const REPAINT_SECONDS: f32 = 0.03;
 
 fn repaint_every(sample_rate: f32) -> usize {
     ((sample_rate * REPAINT_SECONDS) as usize).max(1)
 }
-const RESIZE_HINT: ResizeHint = ResizeHint::resizable()
-    .with_min_logical_size(nice_plug::editor::dpi::LogicalSize::new(760.0, 560.0));
+const RESIZE_HINT: ResizeHint = ResizeHint::resizable().with_min_logical_size(MIN_WINDOW_SIZE);
 
 pub struct Sonomori {
     params: Arc<SonomoriParams>,
