@@ -16,10 +16,6 @@ pub const STEPS_PER_BAR: usize = BEATS_PER_BAR * STEPS_PER_BEAT;
 pub const HALF_BAR: usize = STEPS_PER_BAR / 2;
 pub const MAX_STEPS: usize = STEPS_PER_BAR * BARS_MAX;
 
-/// Playback interpolates between a sample and the one after it, so a slice
-/// shorter than this has nothing to play.
-pub const MIN_SLICE_SAMPLES: usize = 2;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum Lane {
@@ -92,5 +88,39 @@ impl Default for Pattern {
             lanes: [LanePattern::default(); LANES],
             steps: STEPS_PER_BAR,
         }
+    }
+}
+
+pub fn step_at(beats: f64, swing: f64, steps: usize) -> usize {
+    let steps = steps.max(1);
+    let pattern_beats = steps as f64 / STEPS_PER_BEAT as f64;
+    let phase = beats.rem_euclid(pattern_beats);
+    let eighths = phase * (STEPS_PER_BEAT as f64 / 2.0);
+    let pair = eighths.floor() as usize;
+    let frac = eighths - pair as f64;
+    let swing = swing.clamp(f64::from(SWING_MIN), f64::from(SWING_MAX));
+    let step_in_pair = if frac < swing { 0 } else { 1 };
+    (pair * (STEPS_PER_BEAT / 2) + step_in_pair).min(steps - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn straight_grid_lands_on_sixteenths() {
+        assert_eq!(step_at(0.0, 0.5, 16), 0);
+        assert_eq!(step_at(0.24, 0.5, 16), 0);
+        assert_eq!(step_at(0.25, 0.5, 16), 1);
+        assert_eq!(step_at(0.5, 0.5, 16), 2);
+        assert_eq!(step_at(1.0, 0.5, 16), 4);
+        assert_eq!(step_at(4.0, 0.5, 16), 0);
+    }
+
+    #[test]
+    fn swing_delays_the_off_sixteenth() {
+        assert_eq!(step_at(0.25, 0.66, 16), 0);
+        assert_eq!(step_at(0.34, 0.66, 16), 1);
+        assert_eq!(step_at(0.5, 0.66, 16), 2);
     }
 }

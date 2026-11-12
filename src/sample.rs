@@ -10,8 +10,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-use crate::features;
-use crate::score::MIN_SLICE_SAMPLES;
+use crate::features::{self, MIN_SLICE_SAMPLES};
 use crate::slice::{self, SENSITIVITY_BUCKETS};
 
 pub const MAX_SECONDS: f32 = 30.0;
@@ -27,21 +26,6 @@ pub fn formats_phrase() -> String {
         [only] => only.clone(),
         [rest @ .., last] => format!("{}, or {last}", rest.join(", ")),
         [] => String::new(),
-    }
-}
-
-pub fn idle_hint() -> String {
-    format!(
-        "Import a {} file. Longer files use the first {MAX_SECONDS:.0} seconds.",
-        formats_phrase()
-    )
-}
-
-pub fn trimmed_note(trimmed: bool) -> String {
-    if trimmed {
-        format!("  ·  using the first {MAX_SECONDS:.0} seconds")
-    } else {
-        String::new()
     }
 }
 
@@ -194,7 +178,7 @@ impl SampleData {
 
         let mut mono = Vec::with_capacity(frames);
         for index in 0..frames {
-            mono.push(0.5 * (left[index] + right[index]));
+            mono.push(features::mid(left[index], right[index]));
         }
 
         let analysis = slice::analyze(&mono, sample_rate);
@@ -235,6 +219,13 @@ impl SampleData {
 
     pub fn len(&self) -> usize {
         self.left.len()
+    }
+
+    pub fn slices(&self, sensitivity: f32) -> &[features::SliceInfo] {
+        self.buckets
+            .get(slice::sensitivity_bucket(sensitivity))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 

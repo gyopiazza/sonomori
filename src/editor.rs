@@ -8,17 +8,17 @@ use nice_plug::prelude::*;
 
 use crate::features::SliceInfo;
 use crate::params::{SEED_MAX, SEED_MIN, SonomoriParams};
-use crate::sample::{self, IMPORT_EXTENSIONS, SampleData};
+use crate::profile::{self, Watch};
+use crate::sample::{IMPORT_EXTENSIONS, MAX_SECONDS, SampleData, formats_phrase};
 use crate::score::{Lane, Pattern};
 use crate::session::{LoadStatus, Shared, Snapshot};
-use crate::slice::sensitivity_bucket;
-use crate::ui::{Breadth, Color, Painter, Point, Rect, Sense, Surface};
+use crate::ui::{Breadth, Color, MUTED, Painter, Point, Rect, Sense, Surface, TRACK};
 
 fn lane_color(lane: Lane) -> Color {
     match lane {
         Lane::Low => Color::rgb(232, 168, 74),
         Lane::Mid => Color::rgb(224, 92, 78),
-        Lane::High => Color::rgb(86, 196, 184),
+        Lane::High => Color::rgb(96, 170, 236),
         Lane::Extra => Color::rgb(164, 124, 214),
     }
 }
@@ -52,12 +52,8 @@ pub struct SonomoriEditor {
     import_tx: Sender<Option<PathBuf>>,
     import_rx: Receiver<Option<PathBuf>>,
     import_open: bool,
-    /// `SONOMORI_LOAD` / `SONOMORI_PLAY` / `SONOMORI_READY`, used by the
-    /// profiling script. Idle unless those variables are set.
     profile_checked: bool,
-    profile_load_id: u64,
-    profile_play: bool,
-    profile_ready: Option<String>,
+    profile: Watch,
 }
 
 impl SonomoriEditor {
@@ -86,9 +82,7 @@ impl SonomoriEditor {
             import_rx,
             import_open: false,
             profile_checked: false,
-            profile_load_id: 0,
-            profile_play: false,
-            profile_ready: None,
+            profile: Watch::idle(),
         }
     }
 
@@ -104,20 +98,16 @@ impl SonomoriEditor {
         self.gui.clone()
     }
 
+    /// Backends that write a parameter after dropping the editor lock read it here.
+    #[allow(dead_code)]
     pub(crate) fn params(&self) -> &Arc<SonomoriParams> {
         &self.params
     }
 
     fn poll_loads(&mut self) {
         while let Ok(finished) = self.load_rx.try_recv() {
-            let profile = finished.id == self.profile_load_id;
-            if profile {
-                self.profile_load_id = 0;
-            }
             if finished.id != self.active_load_id {
-                if profile {
-                    self.write_profile_ready("fail\n");
-                }
+                let _ = self.profile.finish(finished.id, false);
                 continue;
             }
             match finished.result {
@@ -125,18 +115,13 @@ impl SonomoriEditor {
                     *self.params.sample_path.lock() = data.path.clone();
                     self.path_input = data.path.clone();
                     self.shared.store_sample(data);
-                    if profile && self.profile_play {
+                    if self.profile.finish(finished.id, true) {
                         self.shared.audition.store(true, Ordering::Relaxed);
-                    }
-                    if profile {
-                        self.write_profile_ready("ok\n");
                     }
                 }
                 Err(message) => {
                     self.shared.set_status(LoadStatus::Failed { message });
-                    if profile {
-                        self.write_profile_ready("fail\n");
-                    }
+                    let _ = self.profile.finish(finished.id, false);
                 }
             }
         }
@@ -147,25 +132,11 @@ impl SonomoriEditor {
             return;
         }
         self.profile_checked = true;
-        let Ok(path) = std::env::var("SONOMORI_LOAD") else {
+        let Some(boot) = profile::boot() else {
             return;
         };
-        if path.is_empty() {
-            return;
-        }
-        self.profile_play = std::env::var_os("SONOMORI_PLAY").is_some();
-        self.profile_ready = std::env::var("SONOMORI_READY")
-            .ok()
-            .filter(|path| !path.is_empty());
-        self.begin_load(PathBuf::from(path));
-        self.profile_load_id = self.active_load_id;
-    }
-
-    fn write_profile_ready(&mut self, body: &str) {
-        self.profile_play = false;
-        if let Some(path) = self.profile_ready.take() {
-            let _ = std::fs::write(path, body);
-        }
+        self.begin_load(boot.path.clone());
+        self.profile.arm(self.active_load_id, boot);
     }
 
     fn begin_load(&mut self, path: PathBuf) {
@@ -206,26 +177,12 @@ impl SonomoriEditor {
     /// Inputs of the waveform, transport, and sliders. The playhead is not one
     /// of them: it moves every step and is drawn on its own.
     pub(crate) fn chrome_key(&mut self) -> u64 {
-        let mut hash = mix(0xcbf29ce484222325, 1);
+        let mut hash = self.params.fingerprint();
         hash = mix(hash, self.shared.standalone.load(Ordering::Relaxed) as u64);
         hash = mix(hash, self.shared.audition.load(Ordering::Relaxed) as u64);
         hash = mix(hash, self.import_open as u64);
         hash = mix(hash, self.undo_seed.is_some() as u64);
         hash = mix_str(hash, &self.path_input);
-        hash = mix_float(hash, &self.params.density);
-        hash = mix_float(hash, &self.params.syncopation);
-        hash = mix_float(hash, &self.params.symmetry);
-        hash = mix_float(hash, &self.params.pattern_var);
-        hash = mix_float(hash, &self.params.sound_var);
-        hash = mix_float(hash, &self.params.swing);
-        hash = mix_float(hash, &self.params.decay);
-        hash = mix_float(hash, &self.params.tone);
-        hash = mix_float(hash, &self.params.sensitivity);
-        hash = mix_float(hash, &self.params.tempo);
-        hash = mix_float(hash, &self.params.output);
-        hash = mix_int(hash, &self.params.pitch);
-        hash = mix_int(hash, &self.params.bars);
-        hash = mix_int(hash, &self.params.seed);
         let loaded = self.shared.sample.load();
         hash = mix(
             hash,
@@ -240,7 +197,7 @@ impl SonomoriEditor {
             hash = mix(hash, lane.end as u64);
         }
         hash = mix(hash, snapshot.clock.host_playing as u64);
-        hash = mix(hash, (snapshot.clock.bpm * 10.0).round() as i16 as u64);
+        hash = mix(hash, snapshot.clock.bpm_tenth() as u64);
         let status = self.shared.status.lock();
         mix_status(hash, &status)
     }
@@ -249,9 +206,9 @@ impl SonomoriEditor {
         self.import_open || matches!(*self.shared.status.lock(), LoadStatus::Loading { .. })
     }
 
-    /// Egui and rune paint the whole screen through this. The iced editor
-    /// paints the pieces below so a playhead step can skip the waveform.
-    #[cfg_attr(not(any(test, ui_egui, ui_rune)), allow(dead_code))]
+    /// Whole-screen paint. A backend can paint the pieces below instead, so a
+    /// playhead step can skip the waveform.
+    #[allow(dead_code)]
     pub(crate) fn show(&mut self, ui: &mut impl Surface, setter: &ParamSetter<'_>) {
         self.prepare();
         self.paint_top(ui, setter);
@@ -268,11 +225,9 @@ impl SonomoriEditor {
         let snapshot = *self.snapshot.read();
         let mut queued_load = None;
         let mut request_import = false;
-        let bucket = sensitivity_bucket(self.params.sensitivity.value());
         let slices = sample
             .as_ref()
-            .and_then(|loaded| loaded.buckets.get(bucket))
-            .map(Vec::as_slice)
+            .map(|loaded| loaded.slices(self.params.sensitivity.value()))
             .unwrap_or(&[]);
 
         ui.heading(crate::Sonomori::NAME);
@@ -339,12 +294,7 @@ impl SonomoriEditor {
         } else {
             ui.canvas(Breadth::Fill, 110.0, Sense::Hover, |rect, painter, _| {
                 painter.fill(rect, 4.0, Color::rgb(22, 24, 28));
-                painter.text_centered(
-                    rect.center(),
-                    "No sound loaded",
-                    14.0,
-                    Color::rgb(140, 144, 150),
-                );
+                painter.text_centered(rect.center(), "No sound loaded", 14.0, MUTED);
             });
         }
 
@@ -435,25 +385,11 @@ fn mix(hash: u64, value: u64) -> u64 {
     (hash ^ value).wrapping_mul(0x100000001b3)
 }
 
-fn mix_f32(hash: u64, value: f32) -> u64 {
-    mix(hash, value.to_bits() as u64)
-}
-
 fn mix_str(mut hash: u64, text: &str) -> u64 {
     for byte in text.bytes() {
         hash = mix(hash, byte as u64);
     }
     hash
-}
-
-fn mix_float(hash: u64, param: &nice_plug::prelude::FloatParam) -> u64 {
-    let hash = mix_f32(hash, param.value());
-    mix_f32(hash, param.modulated_normalized_value())
-}
-
-fn mix_int(hash: u64, param: &nice_plug::prelude::IntParam) -> u64 {
-    let hash = mix(hash, param.value() as u32 as u64);
-    mix_f32(hash, param.modulated_normalized_value())
 }
 
 fn mix_status(hash: u64, status: &LoadStatus) -> u64 {
@@ -496,13 +432,20 @@ fn status_line(shared: &Shared, sample: Option<&SampleData>, slice_count: usize)
         LoadStatus::Failed { message } => message.clone(),
         LoadStatus::Idle => match sample {
             Some(loaded) => {
-                let trimmed = sample::trimmed_note(loaded.trimmed);
+                let trimmed = if loaded.trimmed {
+                    format!("  ·  using the first {MAX_SECONDS:.0} seconds")
+                } else {
+                    String::new()
+                };
                 format!(
                     "{}  ·  {} slices  ·  {:.1}s{trimmed}",
                     loaded.name, slice_count, loaded.seconds
                 )
             }
-            None => sample::idle_hint(),
+            None => format!(
+                "Import a {} file. Longer files use the first {MAX_SECONDS:.0} seconds.",
+                formats_phrase()
+            ),
         },
     }
 }
@@ -635,7 +578,7 @@ fn paint_pattern(ui: &mut impl Surface, snapshot: &Snapshot) {
                 let color = if velocity > 0.0 {
                     lane_color(lane).fade(0.35 + 0.65 * velocity)
                 } else {
-                    Color::rgb(38, 40, 46)
+                    TRACK
                 };
                 painter.fill(cell_rect, 2.0, color);
                 if snapshot.playhead == Some(step) {

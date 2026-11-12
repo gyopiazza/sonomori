@@ -3,8 +3,7 @@
 //! The file is scanned once. Each sensitivity bucket reuses that flux curve and
 //! only changes the peak threshold, the minimum gap, and the longest slice.
 
-use crate::features::MAX_SLICES;
-use crate::score::MIN_SLICE_SAMPLES;
+use crate::features::{MAX_SLICES, MIN_SLICE_SAMPLES};
 
 /// Number of precomputed sensitivity settings, from fewest slices to most.
 pub const SENSITIVITY_BUCKETS: usize = 17;

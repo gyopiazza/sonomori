@@ -35,4 +35,4 @@ pub use backend::PluginEditor;
 pub(crate) use backend::{
     EditorState, Repaint, is_open, new_repaint, new_state, open, request_repaint,
 };
-pub(crate) use face::{Breadth, Color, Painter, Point, Rect, Sense, Surface};
+pub(crate) use face::{ACCENT, Breadth, Color, MUTED, Painter, Point, Rect, Sense, Surface, TRACK};

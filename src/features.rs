@@ -1,10 +1,36 @@
 //! Measurements that decide which lane a slice belongs to.
 //!
-//! The loader computes them once. The pattern generator is the only reader.
-//! Band edges and role scores stay together because a kick is both.
+//! The loader computes them once. Band edges and role scores stay together
+//! because a kick is both.
 
 /// Hard cap so the pattern generator and the UI stay bounded.
 pub const MAX_SLICES: usize = 48;
+
+/// Playback interpolates between a sample and the one after it, so a slice
+/// shorter than this has nothing to play.
+pub const MIN_SLICE_SAMPLES: usize = 2;
+
+/// Spread of bassiness below which the slices are one sound, not a kit.
+const ROLE_SPREAD: f32 = 0.08;
+
+#[inline]
+pub(crate) fn mid(left: f32, right: f32) -> f32 {
+    0.5 * (left + right)
+}
+
+pub fn distinct_roles(slices: &[SliceInfo]) -> bool {
+    if slices.len() < 2 {
+        return false;
+    }
+    let mut low = f32::MAX;
+    let mut high = f32::MIN;
+    for slice in slices {
+        let bassiness = slice.low_ratio - slice.high_ratio;
+        low = low.min(bassiness);
+        high = high.max(bassiness);
+    }
+    high - low >= ROLE_SPREAD
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum Role {
@@ -84,7 +110,7 @@ pub fn measure(
     let span = end.saturating_sub(start).max(1);
 
     for index in start..end {
-        let sample = 0.5 * (left[index] + right[index]);
+        let sample = mid(left[index], right[index]);
         low += low_coef * (sample - low);
         body += high_coef * (sample - body);
         let high = sample - body;

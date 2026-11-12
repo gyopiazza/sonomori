@@ -1,6 +1,5 @@
-use crate::score::{
-    LANES, Lane, MAX_STEPS, MIN_SLICE_SAMPLES, Pattern, STEPS_PER_BEAT, SWING_MAX, SWING_MIN,
-};
+use crate::features::MIN_SLICE_SAMPLES;
+use crate::score::{LANES, Lane, MAX_STEPS, Pattern, step_at};
 
 const ATTACK_SAMPLES: u32 = 16;
 const END_FADE_SAMPLES: f64 = 64.0;
@@ -108,6 +107,10 @@ impl Engine {
 
     pub fn set_sample_rate(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate.max(1.0);
+    }
+
+    pub fn sample_rate(&self) -> f32 {
+        self.sample_rate
     }
 
     pub fn reset(&mut self) {
@@ -313,18 +316,6 @@ impl Voice {
     }
 }
 
-pub fn step_at(beats: f64, swing: f64, steps: usize) -> usize {
-    let steps = steps.max(1);
-    let pattern_beats = steps as f64 / STEPS_PER_BEAT as f64;
-    let phase = beats.rem_euclid(pattern_beats);
-    let eighths = phase * (STEPS_PER_BEAT as f64 / 2.0);
-    let pair = eighths.floor() as usize;
-    let frac = eighths - pair as f64;
-    let swing = swing.clamp(f64::from(SWING_MIN), f64::from(SWING_MAX));
-    let step_in_pair = if frac < swing { 0 } else { 1 };
-    (pair * (STEPS_PER_BEAT / 2) + step_in_pair).min(steps - 1)
-}
-
 fn lowpass_coef(tone: f32, sample_rate: f32) -> f32 {
     let tone = tone.clamp(0.0, 1.0);
     if tone >= 0.98 {
@@ -345,23 +336,6 @@ mod tests {
     use crate::sample::SampleData;
     use crate::score::{LANES, LanePattern, Pattern};
     use crate::slice::sensitivity_bucket;
-
-    #[test]
-    fn straight_grid_lands_on_sixteenths() {
-        assert_eq!(step_at(0.0, 0.5, 16), 0);
-        assert_eq!(step_at(0.24, 0.5, 16), 0);
-        assert_eq!(step_at(0.25, 0.5, 16), 1);
-        assert_eq!(step_at(0.5, 0.5, 16), 2);
-        assert_eq!(step_at(1.0, 0.5, 16), 4);
-        assert_eq!(step_at(4.0, 0.5, 16), 0);
-    }
-
-    #[test]
-    fn swing_delays_the_off_sixteenth() {
-        assert_eq!(step_at(0.25, 0.66, 16), 0);
-        assert_eq!(step_at(0.34, 0.66, 16), 1);
-        assert_eq!(step_at(0.5, 0.66, 16), 2);
-    }
 
     #[test]
     fn a_hit_on_beat_two_is_audible_there() {
@@ -410,7 +384,11 @@ mod tests {
         while rendered < frames {
             let count = block.min(frames - rendered);
             for index in 0..count {
-                let beats = (rendered + index) as f64 / f64::from(sample_rate) * 120.0 / 60.0;
+                let beats = crate::session::beats_from_samples(
+                    (rendered + index) as f64,
+                    f64::from(crate::session::DEFAULT_BPM),
+                    f64::from(sample_rate),
+                );
                 let (l, r) = engine.frame(FrameInput {
                     audio: Some(audio),
                     pattern: &pattern,

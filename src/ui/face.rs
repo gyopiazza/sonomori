@@ -31,6 +31,10 @@ impl Color {
     }
 }
 
+pub const ACCENT: Color = Color::rgb(86, 196, 184);
+pub const MUTED: Color = Color::rgb(140, 144, 150);
+pub const TRACK: Color = Color::rgb(38, 40, 46);
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Point {
     pub x: f32,

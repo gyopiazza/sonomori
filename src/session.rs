@@ -13,8 +13,10 @@ use parking_lot::Mutex;
 use crate::sample::SampleData;
 use crate::score::Pattern;
 
-/// Below this the meter is treated as silent by both the process loop and the editor.
+/// Below this a falling meter counts as silence for the editor wake.
 pub const METER_ACTIVE: f32 = 0.001;
+
+pub const DEFAULT_BPM: f32 = 120.0;
 
 #[derive(Clone)]
 pub struct Shared {
@@ -61,7 +63,19 @@ pub struct Clock {
     pub bpm: f32,
 }
 
+pub fn running(host_playing: bool, audition: bool) -> bool {
+    host_playing || audition
+}
+
 impl Clock {
+    pub fn bpm_tenth(self) -> i16 {
+        (self.bpm * 10.0).round() as i16
+    }
+
+    pub fn running(self, audition: bool) -> bool {
+        running(self.host_playing, audition)
+    }
+
     pub fn from_transport(
         standalone: bool,
         transport_playing: bool,
@@ -181,7 +195,7 @@ impl Default for Snapshot {
             playhead: None,
             clock: Clock {
                 host_playing: false,
-                bpm: 120.0,
+                bpm: DEFAULT_BPM,
             },
         }
     }

@@ -14,7 +14,21 @@ use crate::score::{
     STEPS_PER_BEAT,
 };
 
-const LANE_GAIN: [f32; LANES] = [1.0, 0.92, 0.52, 0.7];
+fn lane_gain(lane: Lane) -> f32 {
+    match lane {
+        Lane::Low => 1.0,
+        Lane::Mid => 0.92,
+        Lane::High => 0.52,
+        Lane::Extra => 0.7,
+    }
+}
+
+/// Lane order is the assignment order: earlier lanes keep the slice they claim.
+const LANE_ROLES: [(Lane, Role, u32); 3] = [
+    (Lane::Low, Role::Kick, 900),
+    (Lane::High, Role::Hat, 901),
+    (Lane::Mid, Role::Snare, 902),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GenParams {
@@ -31,16 +45,19 @@ pub struct GenParams {
 }
 
 /// Collapse knob noise so the cache misses only when a macro actually moves.
+/// Every field is named so a new float cannot skip the quantum.
 pub fn cache_key(params: &GenParams) -> GenParams {
     GenParams {
+        seed: params.seed,
         density: quantize_unit(params.density),
         syncopation: quantize_unit(params.syncopation),
         symmetry: quantize_unit(params.symmetry),
         sound_var: quantize_unit(params.sound_var),
         pattern_var: quantize_unit(params.pattern_var),
         decay: quantize_unit(params.decay),
+        pitch: quantize_unit(params.pitch),
         tone: quantize_unit(params.tone),
-        ..*params
+        bars: params.bars,
     }
 }
 
@@ -52,14 +69,14 @@ impl Default for GenParams {
     fn default() -> Self {
         Self {
             seed: 1,
-            density: 0.65,
+            density: 0.62,
             syncopation: 0.1,
-            symmetry: 0.5,
-            sound_var: 0.2,
-            pattern_var: 0.15,
+            symmetry: 0.55,
+            sound_var: 0.25,
+            pattern_var: 0.2,
             decay: 0.55,
             pitch: 0.0,
-            tone: 0.75,
+            tone: 0.78,
             bars: 1,
         }
     }
@@ -88,7 +105,7 @@ pub fn generate(slices: &[SliceInfo], params: &GenParams) -> Pattern {
         lane_pattern.start = slice.map(|slice| slice.start).unwrap_or(0);
         lane_pattern.end = slice.map(|slice| slice.end).unwrap_or(0);
         lane_pattern.norm_gain = slice.map(|slice| slice.norm_gain).unwrap_or(1.0);
-        lane_pattern.gain = LANE_GAIN[index];
+        lane_pattern.gain = lane_gain(lane);
         lane_pattern.pitch = lane_pitch(params.seed, lane, params.pitch, sound_var);
         lane_pattern.decay = lane_decay(params.seed, lane, params.decay, sound_var);
         lane_pattern.tone = lane_tone(params.seed, lane, params.tone, sound_var);
@@ -190,27 +207,41 @@ fn hit(
     (accent + variation * 0.18).clamp(0.2, 1.0)
 }
 
-fn is_accent(lane: Lane, step: usize) -> bool {
+struct Grid {
+    pos: usize,
+    downbeat: bool,
+    eighth_off: bool,
+    sixteenth: bool,
+    anticipation: bool,
+    backbeat: bool,
+}
+
+fn grid(step: usize) -> Grid {
     let pos = step % STEPS_PER_BAR;
-    match lane {
-        Lane::Low => pos % STEPS_PER_BEAT == 0,
-        Lane::Mid => on_backbeat(pos),
-        Lane::High => pos % (STEPS_PER_BEAT / 2) == 0,
-        Lane::Extra => pos % STEPS_PER_BEAT == STEPS_PER_BEAT / 2,
+    Grid {
+        pos,
+        downbeat: pos % STEPS_PER_BEAT == 0,
+        eighth_off: pos % STEPS_PER_BEAT == STEPS_PER_BEAT / 2,
+        sixteenth: pos % (STEPS_PER_BEAT / 2) == 1,
+        anticipation: pos % STEPS_PER_BEAT == STEPS_PER_BEAT - 1,
+        backbeat: pos == STEPS_PER_BEAT || pos == STEPS_PER_BEAT * (BEATS_PER_BAR - 1),
     }
 }
 
-fn on_backbeat(pos: usize) -> bool {
-    pos == STEPS_PER_BEAT || pos == STEPS_PER_BEAT * (BEATS_PER_BAR - 1)
+fn is_accent(lane: Lane, step: usize) -> bool {
+    let grid = grid(step);
+    match lane {
+        Lane::Low => grid.downbeat,
+        Lane::Mid => grid.backbeat,
+        Lane::High => grid.downbeat || grid.eighth_off,
+        Lane::Extra => grid.eighth_off,
+    }
 }
 
 fn step_weight(lane: Lane, step: usize, density: f32, sync: f32) -> f32 {
-    let pos = step % STEPS_PER_BAR;
+    let grid = grid(step);
+    let pos = grid.pos;
     let sync_pos = (sync + 1.0) * 0.5;
-    let downbeat = pos % STEPS_PER_BEAT == 0;
-    let eighth_off = pos % STEPS_PER_BEAT == STEPS_PER_BEAT / 2;
-    let sixteenth = pos % (STEPS_PER_BEAT / 2) == 1;
-    let anticipation = pos % STEPS_PER_BEAT == STEPS_PER_BEAT - 1;
 
     match lane {
         Lane::Low => {
@@ -218,24 +249,24 @@ fn step_weight(lane: Lane, step: usize, density: f32, sync: f32) -> f32 {
                 0.25 + 0.75 * density
             } else if pos == HALF_BAR {
                 density * (0.35 + 0.55 * (1.0 - sync_pos * 0.35))
-            } else if on_backbeat(pos) {
+            } else if grid.backbeat {
                 density * 0.28 * (1.0 - sync_pos * 0.5)
-            } else if eighth_off {
+            } else if grid.eighth_off {
                 density * (0.08 + 0.42 * sync_pos)
-            } else if anticipation {
+            } else if grid.anticipation {
                 density * 0.38 * sync_pos
             } else {
                 density * 0.05 * sync_pos
             }
         }
         Lane::Mid => {
-            if on_backbeat(pos) {
+            if grid.backbeat {
                 0.35 + 0.6 * density
-            } else if anticipation {
+            } else if grid.anticipation {
                 density * (0.08 + 0.7 * sync_pos)
-            } else if sixteenth {
+            } else if grid.sixteenth {
                 density * 0.22 * sync_pos
-            } else if downbeat {
+            } else if grid.downbeat {
                 density * 0.08 * (1.0 - sync_pos)
             } else {
                 density * 0.06
@@ -243,9 +274,9 @@ fn step_weight(lane: Lane, step: usize, density: f32, sync: f32) -> f32 {
         }
         Lane::High => {
             let base = 0.08 + density * 0.88;
-            if sixteenth {
+            if grid.sixteenth {
                 base * (0.08 + 0.92 * sync_pos)
-            } else if eighth_off {
+            } else if grid.eighth_off {
                 base * (0.45 + 0.35 * sync_pos)
             } else {
                 base * (0.92 - 0.55 * sync_pos)
@@ -253,11 +284,11 @@ fn step_weight(lane: Lane, step: usize, density: f32, sync: f32) -> f32 {
         }
         Lane::Extra => {
             let base = density * 0.42;
-            if anticipation {
+            if grid.anticipation {
                 base * (0.35 + 0.9 * sync_pos)
-            } else if eighth_off {
+            } else if grid.eighth_off {
                 base * (0.55 + 0.4 * sync_pos)
-            } else if downbeat {
+            } else if grid.downbeat {
                 base * (0.7 - 0.35 * sync_pos)
             } else {
                 base * (0.25 + 0.4 * sync_pos)
@@ -272,57 +303,35 @@ fn pick_slices(slices: &[SliceInfo], seed: u32) -> [usize; LANES] {
         return [0; LANES];
     }
 
-    let mut bassiness_low = f32::MAX;
-    let mut bassiness_high = f32::MIN;
     let mut scores = [RoleScores::ZERO; MAX_SLICES];
     for index in 0..count {
-        let bassiness = slices[index].low_ratio - slices[index].high_ratio;
-        bassiness_low = bassiness_low.min(bassiness);
-        bassiness_high = bassiness_high.max(bassiness);
         scores[index] = features::role_scores(&slices[index]);
     }
 
     // A shaker or a tone has no kick/snare/hat split. Spread the lanes across
     // the slices instead of forcing a role onto sounds that all match.
-    if count == 1 || bassiness_high - bassiness_low < 0.08 {
+    if !features::distinct_roles(&slices[..count]) {
         return spread_by_index(count, seed);
     }
 
     let mut used = [false; MAX_SLICES];
     let mut chosen = [0usize; LANES];
-    chosen[Lane::Low.index()] = pick_role(&scores, count, Role::Kick, &mut used, seed, 900);
-    chosen[Lane::High.index()] = pick_role(&scores, count, Role::Hat, &mut used, seed, 901);
-    chosen[Lane::Mid.index()] = pick_role(&scores, count, Role::Snare, &mut used, seed, 902);
-    chosen[Lane::Extra.index()] = pick_role_max(&scores, count, &mut used, seed, 903);
+    for (lane, role, salt) in LANE_ROLES {
+        chosen[lane.index()] = claim(count, &mut used, seed, salt, |index| scores[index].of(role));
+    }
+    chosen[Lane::Extra.index()] = claim(count, &mut used, seed, 903, |index| scores[index].best());
     chosen
 }
 
-fn pick_role(
-    scores: &[RoleScores; MAX_SLICES],
-    count: usize,
-    role: Role,
-    used: &mut [bool; MAX_SLICES],
-    seed: u32,
-    salt: u32,
-) -> usize {
-    let pick = pick_top(count, used, seed, salt, |index| scores[index].of(role));
-    if count > 1 {
-        used[pick] = true;
-    }
-    pick
-}
-
-fn pick_role_max(
-    scores: &[RoleScores; MAX_SLICES],
+fn claim(
     count: usize,
     used: &mut [bool; MAX_SLICES],
     seed: u32,
     salt: u32,
+    score_of: impl Fn(usize) -> f32,
 ) -> usize {
-    let pick = pick_top(count, used, seed, salt, |index| scores[index].best());
-    if count > 1 {
-        used[pick] = true;
-    }
+    let pick = pick_top(count, used, seed, salt, score_of);
+    used[pick] = true;
     pick
 }
 

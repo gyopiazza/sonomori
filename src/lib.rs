@@ -3,6 +3,7 @@ mod engine;
 mod features;
 mod params;
 mod pattern;
+mod profile;
 mod sample;
 mod score;
 mod session;
@@ -17,12 +18,12 @@ use std::sync::atomic::Ordering;
 use nice_plug::prelude::*;
 
 use editor::SonomoriEditor;
-use engine::{Audio, Engine, FrameInput, Preview, step_at};
+use engine::{Audio, Engine, FrameInput, Preview};
 use params::{SonomoriParams, gen_params};
 use pattern::{GenParams, cache_key};
-use score::{MAX_STEPS, Pattern};
+use score::{MAX_STEPS, Pattern, step_at};
 use session::{
-    BeatCursor, Clock, LoadStatus, METER_ACTIVE, Shared, Snapshot, beats_from_samples,
+    BeatCursor, Clock, LoadStatus, METER_ACTIVE, Shared, Snapshot, beats_from_samples, running,
 };
 use slice::sensitivity_bucket;
 
@@ -51,7 +52,6 @@ pub struct Sonomori {
     engine: Engine,
     pattern: Pattern,
     pattern_key: Option<(Option<u64>, usize, GenParams)>,
-    sample_rate: f32,
     beats: BeatCursor,
     attempted_path: String,
     /// Bumps when the pattern is rebuilt, so the editor can wake without a
@@ -81,7 +81,6 @@ impl Default for Sonomori {
             engine: Engine::new(DEFAULT_SAMPLE_RATE),
             pattern: Pattern::default(),
             pattern_key: None,
-            sample_rate: DEFAULT_SAMPLE_RATE,
             beats: BeatCursor::default(),
             attempted_path: String::new(),
             pattern_serial: 0,
@@ -164,7 +163,6 @@ impl Plugin for Sonomori {
         buffer_config: &BufferConfig,
         context: &mut impl ActivateContext<Self>,
     ) -> bool {
-        self.sample_rate = buffer_config.sample_rate;
         self.engine.set_sample_rate(buffer_config.sample_rate);
         self.shared.standalone.store(
             context.plugin_api() == PluginApi::Standalone,
@@ -197,14 +195,13 @@ impl Plugin for Sonomori {
             preview_index = Some(index as usize);
         }
 
-        let bucket = sensitivity_bucket(self.params.sensitivity.value());
+        let sensitivity = self.params.sensitivity.value();
         let generation = sample.map(|loaded| loaded.generation);
-        let settings = gen_params(&self.params);
-        let key = (generation, bucket, cache_key(&settings));
+        let settings = cache_key(&gen_params(&self.params));
+        let key = (generation, sensitivity_bucket(sensitivity), settings);
         if self.pattern_key != Some(key) {
             let slices = sample
-                .and_then(|loaded| loaded.buckets.get(bucket))
-                .map(|slices| slices.as_slice())
+                .map(|loaded| loaded.slices(sensitivity))
                 .unwrap_or(&[]);
             self.pattern = pattern::generate(slices, &settings);
             self.pattern_key = Some(key);
@@ -222,14 +219,15 @@ impl Plugin for Sonomori {
             transport.tempo,
             self.params.tempo.value() as f64,
         );
-        let playing = clock.host_playing || audition;
+        let playing = clock.running(audition);
+        let sample_rate = self.engine.sample_rate();
 
         let block = self.beats.begin(
             clock,
             audition,
             transport.pos_beats,
             transport.pos_samples,
-            self.sample_rate as f64,
+            sample_rate as f64,
         );
         if block.disarm {
             self.engine.disarm_step();
@@ -241,11 +239,11 @@ impl Plugin for Sonomori {
         let swing = self.params.swing.value();
         let frames = buffer.samples();
         let channels = buffer.channels();
-        let beats_per_sample = beats_from_samples(1.0, bpm, self.sample_rate as f64);
+        let beats_per_sample = beats_from_samples(1.0, bpm, sample_rate as f64);
         let outputs = buffer.as_slice();
         let mut peak = 0.0f32;
         let preview = preview_index.and_then(|index| {
-            let slice = sample?.buckets.get(bucket)?.get(index)?;
+            let slice = sample?.slices(sensitivity).get(index)?;
             Some(Preview {
                 start: slice.start,
                 end: slice.end,
@@ -287,7 +285,7 @@ impl Plugin for Sonomori {
         self.beats.commit(&block, advanced);
 
         let held = self.shared.meter.load(Ordering::Relaxed);
-        let decay = 0.25f32.powf(frames as f32 / (self.sample_rate * 0.15).max(1.0));
+        let decay = 0.25f32.powf(frames as f32 / (sample_rate * 0.15).max(1.0));
         let next_meter = if peak > held { peak } else { held * decay };
         self.shared.meter.store(next_meter, Ordering::Relaxed);
 
@@ -302,14 +300,19 @@ impl Plugin for Sonomori {
             host_playing: clock.host_playing,
             audition,
             standalone,
-            bpm_tenth: (f32::from(clock.bpm) * 10.0).round() as i16,
+            bpm_tenth: clock.bpm_tenth(),
             pattern: self.pattern_serial,
             meter: meter_bucket(next_meter),
         };
         // The picture only changes when the step, transport, pattern, or a
         // stopped meter moves. Copying the score into the snapshot and waking
         // the window on every block redraws an unchanged editor.
-        match ui_wake(self.ui_view, next_view, self.repaint_accum, self.meter_interval) {
+        match ui_wake(
+            self.ui_view,
+            next_view,
+            self.repaint_accum,
+            self.meter_interval,
+        ) {
             UiWake::Now => {
                 if self.ui_view.musical_ne(next_view) {
                     self.snapshot_tx.write(Snapshot {
@@ -388,7 +391,7 @@ impl Default for UiView {
 
 impl UiView {
     fn playing(self) -> bool {
-        self.host_playing || self.audition
+        running(self.host_playing, self.audition)
     }
 
     fn musical_ne(self, other: Self) -> bool {
@@ -458,10 +461,7 @@ mod ui_wake_tests {
         let mut next = previous;
         next.step = Some(1);
         next.meter = 20;
-        assert!(matches!(
-            ui_wake(previous, next, 0, 1_000),
-            UiWake::Now
-        ));
+        assert!(matches!(ui_wake(previous, next, 0, 1_000), UiWake::Now));
     }
 
     #[test]
@@ -472,10 +472,7 @@ mod ui_wake_tests {
         previous.meter = 10;
         let mut next = previous;
         next.meter = 4;
-        assert!(matches!(
-            ui_wake(previous, next, 10_000, 100),
-            UiWake::Idle
-        ));
+        assert!(matches!(ui_wake(previous, next, 10_000, 100), UiWake::Idle));
     }
 
     #[test]
@@ -484,10 +481,7 @@ mod ui_wake_tests {
         let mut next = previous;
         next.meter = 8;
         assert!(matches!(ui_wake(previous, next, 10, 1_000), UiWake::Wait));
-        assert!(matches!(
-            ui_wake(previous, next, 1_000, 1_000),
-            UiWake::Now
-        ));
+        assert!(matches!(ui_wake(previous, next, 1_000, 1_000), UiWake::Now));
     }
 
     #[test]
