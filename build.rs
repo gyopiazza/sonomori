@@ -1,8 +1,13 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/ui/ui.rs");
-    println!("cargo:rustc-check-cfg=cfg(ui_rune)");
-    println!("cargo:rustc-check-cfg=cfg(ui_egui)");
-    println!("cargo:rustc-check-cfg=cfg(ui_iced)");
+
+    // One line per backend: the `Ui` variant in src/ui/ui.rs, and the cfg
+    // that src/ui/mod.rs uses to compile that module.
+    const BACKENDS: &[(&str, &str)] = &[("Ui::Iced", "ui_iced")];
+
+    for (_, cfg) in BACKENDS {
+        println!("cargo:rustc-check-cfg=cfg({cfg})");
+    }
 
     let src = std::fs::read_to_string("src/ui/ui.rs").expect("read src/ui/ui.rs");
     let mut choice = None;
@@ -14,18 +19,16 @@ fn main() {
         let Some(rest) = line.strip_prefix("pub const BACKEND") else {
             continue;
         };
-        let picked: Vec<&str> = [
-            ("Ui::Rune", "ui_rune"),
-            ("Ui::Egui", "ui_egui"),
-            ("Ui::Iced", "ui_iced"),
-        ]
-        .into_iter()
-        .filter(|(needle, _)| rest.contains(needle))
-        .map(|(_, cfg)| cfg)
-        .collect();
+        let picked: Vec<&str> = BACKENDS
+            .iter()
+            .filter(|(needle, _)| rest.contains(needle))
+            .map(|(_, cfg)| *cfg)
+            .collect();
         if picked.len() != 1 {
+            let names: Vec<&str> = BACKENDS.iter().map(|(needle, _)| *needle).collect();
             panic!(
-                "src/ui/ui.rs must set BACKEND to exactly one of Ui::Rune, Ui::Egui, or Ui::Iced"
+                "src/ui/ui.rs must set BACKEND to exactly one of {}",
+                names.join(", ")
             );
         }
         if choice.is_some() {
@@ -34,7 +37,11 @@ fn main() {
         choice = Some(picked[0]);
     }
     let Some(cfg) = choice else {
-        panic!("src/ui/ui.rs must set BACKEND to Ui::Rune, Ui::Egui, or Ui::Iced");
+        let names: Vec<&str> = BACKENDS.iter().map(|(needle, _)| *needle).collect();
+        panic!(
+            "src/ui/ui.rs must set BACKEND to {}",
+            names.join(", ")
+        );
     };
     println!("cargo:rustc-cfg={cfg}");
 }

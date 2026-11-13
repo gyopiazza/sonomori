@@ -13,9 +13,7 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 arc-swap = "1"
 atomic_float = "1.1"
-egui = { version = "0.37.0", features = ["default_fonts"] }
 nice-plug = { version = "0.4.2", features = ["standalone"] }
-nice-plug-egui = "0.6.0"
 # wgpu only. The software renderer redraws the whole window on macOS and
 # spikes the CPU while the playhead is moving. Canvas is the waveform path.
 # The thread pool is the executor the poll subscription needs. Fira Sans is
@@ -45,21 +43,7 @@ symphonia = { version = "0.5", default-features = false, features = [
 triple_buffer = "9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-baseview = "0.4.2"
 dispatch2 = "0.3"
-keyboard-types = "0.8.3"
-objc2 = "0.6.5"
-objc2-app-kit = { version = "0.3.2", features = ["NSView", "objc2-quartz-core"] }
-objc2-quartz-core = { version = "0.3.2", features = [
-    "CALayer",
-    "CAMetalLayer",
-    "objc2-core-foundation",
-] }
-raw-window-handle = "0.6.2"
-rune = { git = "https://github.com/anomalyco/rune", rev = "bba30a61cfcec6683e3fdedf156a92dae89d8b04", default-features = false, features = [
-    "embedded-fonts",
-    "metal-backend",
-] }
 
 [profile.dev]
 opt-level = 1

@@ -1,0 +1,5 @@
+# macOS ships Apple Silicon only, so tune codegen for the M1 baseline.
+# Every M-series chip supports the apple-m1 feature set. Intel Macs are not
+# supported; an x86_64-apple-darwin build is unaffected by this section.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=apple-m1"]

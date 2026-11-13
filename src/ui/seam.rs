@@ -24,8 +24,8 @@ fn visit(dir: &std::path::Path, ui: &std::path::Path, hits: &mut Vec<String>) {
         if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
             continue;
         }
-        // Only the vocabulary file is scanned. A backend may also be named
-        // `face.rs`, and that file is allowed to name its library.
+        // A backend under src/ui may name its library. `face.rs` is the
+        // vocabulary, so it is scanned with the rest of the crate.
         if path.starts_with(ui) && path != ui.join("face.rs") {
             continue;
         }
@@ -37,7 +37,7 @@ fn visit(dir: &std::path::Path, ui: &std::path::Path, hits: &mut Vec<String>) {
 }
 
 fn names_a_library(text: &str) -> bool {
-    text.contains("egui") || text.contains("rune") || has_word(text, "iced")
+    has_word(text, "iced")
 }
 
 /// `sliced` contains the letters of the iced crate name. Match the word.

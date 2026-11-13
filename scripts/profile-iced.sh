@@ -2,8 +2,8 @@
 # Profile the iced standalone while it plays a file.
 #
 # Builds a release standalone, loads the wav, starts playback, and writes a
-# CPU / RSS / footprint log. Egui and rune are not launched. The editor
-# backend in src/ui/ui.rs must be Ui::Iced.
+# CPU / RSS / footprint log. The editor backend in src/ui/ui.rs must be
+# Ui::Iced.
 #
 # SONOMORI_PROFILE_BUILD=profiling uses the profiling profile instead, which
 # keeps line tables so the stack sample at the end of the log has names. That
@@ -49,7 +49,7 @@ cleanup() {
 trap cleanup EXIT
 
 if ! grep -q 'pub const BACKEND: Ui = Ui::Iced;' "$ROOT/src/ui/ui.rs"; then
-    echo "src/ui/ui.rs is not Ui::Iced. This script skips egui and rune." >&2
+    echo "src/ui/ui.rs is not Ui::Iced. This script profiles the iced editor." >&2
     exit 2
 fi
 
